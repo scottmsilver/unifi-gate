@@ -1,0 +1,29 @@
+# Gradle
+.gradle/
+build/
+local.properties
+
+# IDE
+.idea/
+*.iml
+.DS_Store
+
+# Android
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Kotlin
+*.kotlin_module
+
+# Test
+/captures
+.externalNativeBuild/
+.cxx/
+
+# Firebase (contains API keys)
+google-services.json
+keystore/release.keystore
+keystore.properties
+play-service-account.json

@@ -1,0 +1,1902 @@
+<!DOCTYPE html>
+<html lang="en" class="antialiased bg-gray-50">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Access</title>
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- Firebase SDKs -->
+    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-auth-compat.js"></script>
+    <style>
+        /* UniFi-like Blue */
+        :root { --primary: #0055ff; }
+        body { background-color: #f4f5f7; color: #1f2937; }
+        .btn-press:active { transform: scale(0.96); transition: transform 0.1s; }
+    </style>
+</head>
+<body class="min-h-screen flex justify-center pt-10 px-4">
+
+    <div id="root" class="w-full max-w-lg"></div>
+
+    <!-- Server-provided values (Jinja2 processed) -->
+    <script>
+        window.SERVER_CONFIG = {
+            userEmail: "{{ user_email }}",
+            isAdmin: {{ 'true' if is_admin else 'false' }},
+            devMode: {{ 'true' if dev_mode else 'false' }},
+            adminMode: {{ 'true' if admin_mode else 'false' }}
+        };
+        window.FIREBASE_CONFIG = {{ firebase_config | tojson }};
+    </script>
+
+    <script type="text/babel">
+    {% raw %}
+        const { useState, useEffect, createContext, useContext } = React;
+
+        // =========== Constants ===========
+        const HOURS_12 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        const MINUTES_15 = ['00', '15', '30', '45'];
+        const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+        // =========== CSS Class Constants ===========
+        const STYLES = {
+            // Containers
+            card: 'bg-white rounded-xl shadow-sm border border-gray-200',
+            cardWithPadding: 'bg-white p-6 rounded-xl shadow-sm border border-gray-200',
+            centeredCard: 'bg-white p-8 rounded-xl shadow-sm border border-gray-200 max-w-sm w-full',
+
+            // Form inputs
+            input: 'w-full bg-gray-50 p-3 rounded-lg border border-gray-200 text-sm outline-none focus:border-blue-500',
+            inputSmall: 'bg-gray-50 p-2 rounded-lg border border-gray-200 text-sm outline-none focus:border-blue-500',
+            selectLarge: 'text-2xl font-medium bg-gray-100 rounded-lg px-3 py-2 border-0 focus:ring-2 focus:ring-blue-500 appearance-none text-center',
+
+            // Buttons
+            btnPrimary: 'bg-blue-600 text-white font-bold py-3 rounded-lg btn-press text-sm',
+            btnSecondary: 'bg-gray-100 hover:bg-gray-200 text-gray-700 font-medium py-2.5 rounded-lg text-sm transition-colors',
+            btnOutline: 'border border-gray-300 text-gray-700 font-medium hover:bg-gray-50',
+            btnDanger: 'text-red-500 hover:text-red-600',
+
+            // Labels
+            label: 'block text-xs font-bold text-gray-500 uppercase tracking-wide mb-1',
+            sectionHeader: 'text-xs font-bold uppercase tracking-wide mb-2',
+
+            // Info sections
+            infoSection: 'bg-gray-50 rounded-lg p-3',
+            infoRow: 'flex justify-between py-1.5 border-b border-gray-50 last:border-0',
+        };
+
+        // =========== Reusable Components ===========
+
+        // Loading Spinner Component
+        function Spinner({ size = 'md', className = '' }) {
+            const sizeClasses = {
+                sm: 'h-5 w-5',
+                md: 'h-6 w-6',
+                lg: 'h-8 w-8'
+            };
+            return (
+                <div className={`animate-spin rounded-full border-b-2 border-blue-600 ${sizeClasses[size]} ${className}`}></div>
+            );
+        }
+
+        // Centered Loading Spinner
+        function LoadingSpinner({ size = 'md' }) {
+            return (
+                <div className="flex justify-center py-4">
+                    <Spinner size={size} />
+                </div>
+            );
+        }
+
+        // Full page loading state
+        function FullPageLoading() {
+            return <div className="flex justify-center pt-20"><Spinner size="lg" /></div>;
+        }
+
+        // Status Badge Component (unified)
+        function StatusBadge({ status, active, label }) {
+            // If active/label props are provided, use simple active/inactive style
+            if (typeof active !== 'undefined') {
+                return (
+                    <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${active ? 'bg-green-100 text-green-800' : 'bg-gray-100 text-gray-600'}`}>
+                        {active && <span className="w-1.5 h-1.5 rounded-full bg-green-500 mr-1.5"></span>}
+                        {label}
+                    </span>
+                );
+            }
+            // Otherwise use status-based coloring
+            const colors = {
+                approved: 'bg-green-100 text-green-800',
+                pending: 'bg-yellow-100 text-yellow-800',
+                rejected: 'bg-red-100 text-red-800'
+            };
+            return (
+                <span className={`px-2 py-0.5 rounded text-xs font-medium ${colors[status] || 'bg-gray-100 text-gray-800'}`}>
+                    {status}
+                </span>
+            );
+        }
+
+        // Role Badge Component
+        function RoleBadge({ role }) {
+            const isAdmin = role === 'admin';
+            return (
+                <span className={`px-2 py-0.5 rounded text-xs font-medium ${isAdmin ? 'bg-purple-100 text-purple-800' : 'bg-gray-100 text-gray-600'}`}>
+                    {role}
+                </span>
+            );
+        }
+
+        // Info Row Component (for debug panels and settings)
+        function InfoRow({ label, value, mono }) {
+            return (
+                <div className={STYLES.infoRow}>
+                    <span className="text-gray-500 text-xs">{label}</span>
+                    <span className={`text-gray-900 text-xs ${mono ? 'font-mono' : 'font-medium'}`}>{value}</span>
+                </div>
+            );
+        }
+
+        // =========== SVG Icon Components ===========
+        function LockIcon({ locked = true, className = 'w-6 h-6' }) {
+            if (locked) {
+                return (
+                    <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zM12 7a4 4 0 00-4 4v2h8V11a4 4 0 00-4-4z" />
+                    </svg>
+                );
+            }
+            return (
+                <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 11V7a4 4 0 118 0m-4 8v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2z" />
+                </svg>
+            );
+        }
+
+        function SettingsIcon({ className = 'w-4 h-4' }) {
+            return (
+                <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                </svg>
+            );
+        }
+
+        function SignOutIcon({ className = 'w-4 h-4' }) {
+            return (
+                <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+                </svg>
+            );
+        }
+
+        function CloseIcon({ className = 'w-5 h-5' }) {
+            return (
+                <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+            );
+        }
+
+        function ClockIcon({ className = 'w-8 h-8' }) {
+            return (
+                <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+            );
+        }
+
+        // Google Logo SVG
+        function GoogleLogo({ className = 'w-5 h-5' }) {
+            return (
+                <svg className={className} viewBox="0 0 24 24">
+                    <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+                    <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+                    <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
+                    <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+                </svg>
+            );
+        }
+
+        // =========== Firebase Configuration ===========
+        // Injected from server environment variables via window.FIREBASE_CONFIG
+        const firebaseConfig = window.FIREBASE_CONFIG;
+
+        // Initialize Firebase (only if config is set)
+        let firebaseApp = null;
+        let firebaseAuth = null;
+        if (firebaseConfig.apiKey && firebaseConfig.apiKey !== "YOUR_API_KEY") {
+            firebaseApp = firebase.initializeApp(firebaseConfig);
+            firebaseAuth = firebase.auth();
+        }
+
+        // =========== Auth Context ===========
+        const AuthContext = createContext(null);
+
+        function AuthProvider({ children }) {
+            const [user, setUser] = useState(null);
+            const [token, setToken] = useState(localStorage.getItem('authToken'));
+            const [loading, setLoading] = useState(true);
+            const [authError, setAuthError] = useState(null);
+
+            // Server values (from window.SERVER_CONFIG set by Jinja2)
+            const serverEmail = window.SERVER_CONFIG.userEmail;
+            const serverIsAdmin = window.SERVER_CONFIG.isAdmin;
+            const devMode = window.SERVER_CONFIG.devMode;
+
+            useEffect(() => {
+                // In dev mode or if already authenticated via Cloudflare, skip Firebase
+                if (devMode || (serverEmail && serverEmail !== '' && serverEmail !== 'Guest')) {
+                    setUser({ email: serverEmail, isAdmin: serverIsAdmin, source: 'server' });
+                    setLoading(false);
+                    return;
+                }
+
+                // If Firebase is configured, listen for auth state changes
+                if (firebaseAuth) {
+                    const unsubscribe = firebaseAuth.onAuthStateChanged(async (firebaseUser) => {
+                        if (firebaseUser) {
+                            try {
+                                const idToken = await firebaseUser.getIdToken();
+                                setToken(idToken);
+                                localStorage.setItem('authToken', idToken);
+
+                                // Verify with backend
+                                const res = await authFetch('/auth/me');
+                                if (res.ok) {
+                                    const data = await res.json();
+                                    setUser({
+                                        email: data.email,
+                                        isAdmin: data.is_admin,
+                                        status: (data.user && data.user.status),
+                                        source: 'firebase',
+                                        displayName: firebaseUser.displayName,
+                                        photoURL: firebaseUser.photoURL
+                                    });
+                                } else {
+                                    // User authenticated with Firebase but not approved
+                                    setUser({
+                                        email: firebaseUser.email,
+                                        isAdmin: false,
+                                        status: 'unapproved',
+                                        source: 'firebase',
+                                        displayName: firebaseUser.displayName,
+                                        photoURL: firebaseUser.photoURL
+                                    });
+                                }
+                            } catch (err) {
+                                console.error('Auth check failed:', err);
+                                setAuthError(err.message);
+                            }
+                        } else {
+                            setUser(null);
+                            setToken(null);
+                            localStorage.removeItem('authToken');
+                        }
+                        setLoading(false);
+                    });
+                    return () => unsubscribe();
+                } else {
+                    // No Firebase config, rely on server-side auth
+                    setLoading(false);
+                }
+            }, []);
+
+            // Refresh token periodically
+            useEffect(() => {
+                if (!firebaseAuth || !user) return;
+
+                const refreshToken = async () => {
+                    const currentUser = firebaseAuth.currentUser;
+                    if (currentUser) {
+                        const newToken = await currentUser.getIdToken(true);
+                        setToken(newToken);
+                        localStorage.setItem('authToken', newToken);
+                    }
+                };
+
+                // Refresh every 50 minutes (tokens expire in 60)
+                const interval = setInterval(refreshToken, 50 * 60 * 1000);
+                return () => clearInterval(interval);
+            }, [user]);
+
+            const signInWithGoogle = async () => {
+                if (!firebaseAuth) {
+                    setAuthError('Firebase not configured');
+                    return;
+                }
+                try {
+                    const provider = new firebase.auth.GoogleAuthProvider();
+                    await firebaseAuth.signInWithPopup(provider);
+                } catch (err) {
+                    setAuthError(err.message);
+                }
+            };
+
+            const signOut = async () => {
+                if (firebaseAuth) {
+                    await firebaseAuth.signOut();
+                }
+                setUser(null);
+                setToken(null);
+                localStorage.removeItem('authToken');
+            };
+
+            return (
+                <AuthContext.Provider value={{
+                    user,
+                    token,
+                    loading,
+                    authError,
+                    signInWithGoogle,
+                    signOut,
+                    isAuthenticated: !!user && user.status !== 'unapproved',
+                    devMode
+                }}>
+                    {children}
+                </AuthContext.Provider>
+            );
+        }
+
+        function useAuth() {
+            return useContext(AuthContext);
+        }
+
+        // =========== Authenticated Fetch ===========
+        async function authFetch(url, options = {}) {
+            const token = localStorage.getItem('authToken');
+            const headers = { ...options.headers };
+
+            if (token) {
+                headers['Authorization'] = `Bearer ${token}`;
+            }
+
+            return fetch(url, { ...options, headers });
+        }
+
+        // Default end time for "hold today" (6 PM = 18:00)
+        const DEFAULT_END_HOUR = 18;
+
+        // =========== Profile Dropdown Component ===========
+        function ProfileDropdown({ user, isConnected, onSettingsClick, onSignOut }) {
+            const [isOpen, setIsOpen] = useState(false);
+            const dropdownRef = React.useRef(null);
+
+            // Close dropdown when clicking outside
+            useEffect(() => {
+                const handleClickOutside = (event) => {
+                    if (dropdownRef.current && !dropdownRef.current.contains(event.target)) {
+                        setIsOpen(false);
+                    }
+                };
+                document.addEventListener('mousedown', handleClickOutside);
+                return () => document.removeEventListener('mousedown', handleClickOutside);
+            }, []);
+
+            // Extract first name from displayName, or email prefix as fallback
+            const getDisplayName = () => {
+                if (!user) return 'Guest';
+                if (user.source === 'server' && user.email === 'Guest') return 'Guest';
+                if (user.displayName) {
+                    return user.displayName.split(' ')[0].slice(0, 12);
+                }
+                if (user.email) {
+                    return user.email.split('@')[0].slice(0, 12);
+                }
+                return 'User';
+            };
+
+            // Get first letter for avatar fallback
+            const getAvatarLetter = () => {
+                if (user && user.displayName) {
+                    return user.displayName.charAt(0).toUpperCase();
+                }
+                if (user && user.email) {
+                    return user.email.charAt(0).toUpperCase();
+                }
+                return '?';
+            };
+
+            const displayName = getDisplayName();
+            const avatarLetter = getAvatarLetter();
+            const hasPhoto = user && user.photoURL;
+            const isGuest = !user || (user.source === 'server' && user.email === 'Guest');
+            const isAdmin = user && user.isAdmin;
+            const borderColor = isConnected ? 'border-green-500' : 'border-red-500';
+            const bgColor = isConnected ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700';
+            const dotColor = isConnected ? 'bg-green-500' : 'bg-red-500';
+
+            return (
+                <div className="relative" ref={dropdownRef}>
+                    <button
+                        onClick={() => setIsOpen(!isOpen)}
+                        className="flex items-center gap-2 px-2 py-1 rounded-full hover:bg-gray-100 transition-colors"
+                    >
+                        <span className="text-xs text-gray-500 font-medium">{displayName}</span>
+                        {isGuest ? (
+                            <div className={`h-2 w-2 rounded-full ${dotColor}`}></div>
+                        ) : hasPhoto ? (
+                            <img
+                                src={user.photoURL}
+                                alt="Profile"
+                                className={`h-6 w-6 rounded-full border-2 ${borderColor} object-cover`}
+                            />
+                        ) : (
+                            <div className={`h-6 w-6 rounded-full flex items-center justify-center text-xs font-bold ${bgColor}`}>
+                                {avatarLetter}
+                            </div>
+                        )}
+                    </button>
+
+                    {isOpen && (
+                        <div className="absolute right-0 mt-2 w-48 bg-white rounded-lg shadow-lg border border-gray-200 py-1 z-50">
+                            {user && user.email && user.email !== 'Guest' && (
+                                <div className="px-4 py-2 border-b border-gray-100">
+                                    <div className="flex items-center gap-2">
+                                        <p className="text-sm font-medium text-gray-900 truncate">{user.displayName || user.email}</p>
+                                        {isAdmin && (
+                                            <span className="text-[10px] font-bold text-blue-600 bg-blue-50 px-1.5 py-0.5 rounded shrink-0">Admin</span>
+                                        )}
+                                    </div>
+                                    {user.displayName && <p className="text-xs text-gray-500 truncate">{user.email}</p>}
+                                </div>
+                            )}
+                            <button
+                                onClick={() => { setIsOpen(false); onSettingsClick(); }}
+                                className="w-full flex items-center gap-3 px-4 py-2 text-sm text-gray-700 hover:bg-gray-50"
+                            >
+                                <SettingsIcon className="w-4 h-4 text-gray-400" />
+                                Settings
+                            </button>
+                            {user && user.source === 'firebase' && (
+                                <button
+                                    onClick={() => { setIsOpen(false); onSignOut(); }}
+                                    className="w-full flex items-center gap-3 px-4 py-2 text-sm text-red-600 hover:bg-red-50 border-t border-gray-100"
+                                >
+                                    <SignOutIcon className="w-4 h-4 text-red-400" />
+                                    Sign Out
+                                </button>
+                            )}
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // Format time as "6p", "7:30p" style
+        const formatTimeShort = (hours, minutes = 0) => {
+            const ampm = hours >= 12 ? 'p' : 'a';
+            const displayHour = hours % 12 || 12;
+            const displayMin = minutes > 0 ? `:${minutes.toString().padStart(2, '0')}` : '';
+            return `${displayHour}${displayMin}${ampm}`;
+        };
+
+        // Default end time display (e.g., "6p")
+        const DEFAULT_END_TIME_DISPLAY = formatTimeShort(DEFAULT_END_HOUR);
+
+        // =========== Login Screen ===========
+        function LoginScreen() {
+            const { signInWithGoogle, authError, devMode } = useAuth();
+
+            if (devMode) {
+                return null; // Dev mode doesn't show login
+            }
+
+            return (
+                <div className="min-h-[60vh] flex flex-col items-center justify-center">
+                    <div className={STYLES.centeredCard}>
+                        <div className="text-center mb-6">
+                            <div className="w-16 h-16 bg-blue-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                                <LockIcon locked={true} className="w-8 h-8 text-blue-600" />
+                            </div>
+                            <h1 className="text-xl font-bold text-gray-900">UniFi Gate</h1>
+                            <p className="text-sm text-gray-500 mt-1">Sign in to continue</p>
+                        </div>
+
+                        <button
+                            onClick={signInWithGoogle}
+                            className="w-full flex items-center justify-center gap-3 bg-white border border-gray-300 rounded-lg px-4 py-3 text-gray-700 font-medium hover:bg-gray-50 transition-colors"
+                        >
+                            <GoogleLogo />
+                            Sign in with Google
+                        </button>
+
+                        {authError && (
+                            <p className="text-red-500 text-sm text-center mt-4">{authError}</p>
+                        )}
+
+                        <p className="text-xs text-gray-400 text-center mt-6">
+                            You need an invitation to access this app.
+                        </p>
+                    </div>
+                </div>
+            );
+        }
+
+        // =========== Pending Approval Screen ===========
+        function PendingApprovalScreen() {
+            const { user, signOut } = useAuth();
+
+            return (
+                <div className="min-h-[60vh] flex flex-col items-center justify-center">
+                    <div className={`${STYLES.centeredCard} text-center`}>
+                        <div className="w-16 h-16 bg-yellow-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                            <ClockIcon className="w-8 h-8 text-yellow-600" />
+                        </div>
+                        <h1 className="text-xl font-bold text-gray-900">Awaiting Approval</h1>
+                        <p className="text-sm text-gray-500 mt-2">
+                            Your account ({(user && user.email)}) is pending admin approval.
+                        </p>
+                        <button
+                            onClick={signOut}
+                            className="mt-6 text-sm text-gray-500 hover:text-gray-700"
+                        >
+                            Sign out
+                        </button>
+                    </div>
+                </div>
+            );
+        }
+
+        function App() {
+            const { user, loading: authLoading, isAuthenticated, devMode, signOut } = useAuth();
+            const [doors, setDoors] = useState([]);
+            const [config, setConfig] = useState({ configured: false, connected: false, site_name: 'Access', site_timezone: null });
+            const [loading, setLoading] = useState(true);
+            const [view, setView] = useState('loading');
+            const adminMode = window.SERVER_CONFIG.adminMode;
+
+            const checkConfig = async (autoRedirect = false) => {
+                try {
+                    const res = await authFetch('/config');
+                    const data = await res.json();
+                    setConfig(data);
+
+                    if (!data.connected) {
+                        setView('setup'); // Always force setup if disconnected
+                    } else if (autoRedirect && view === 'loading') {
+                        setView(adminMode ? 'setup' : 'dashboard'); // Admin mode goes to settings
+                    }
+                } catch (err) {
+                    console.error("Config check failed", err);
+                } finally {
+                    setLoading(false);
+                }
+            };
+
+            const fetchDoors = async () => {
+                try {
+                    const res = await authFetch('/devices');
+                    if (!res.ok) throw new Error("Failed");
+                    const data = await res.json();
+                    const extendedDoors = await Promise.all(data.map(async (door) => {
+                        try {
+                            const statusRes = await authFetch(`/status/${door.id}`);
+                            const statusData = await statusRes.json();
+                            return { ...door, ...statusData };
+                        } catch (e) {
+                            return door;
+                        }
+                    }));
+                    setDoors(extendedDoors);
+                } catch (err) {
+                    console.error(err);
+                }
+            };
+
+            // Initial load (only after auth is ready)
+            useEffect(() => {
+                if (!authLoading && (isAuthenticated || devMode)) {
+                    checkConfig(true);
+                }
+            }, [authLoading, isAuthenticated, devMode]);
+
+            // Polling
+            useEffect(() => {
+                if (view === 'dashboard' && (isAuthenticated || devMode)) {
+                    fetchDoors(); // Fetch immediately on switch
+                    const interval = setInterval(fetchDoors, 3000);
+                    return () => clearInterval(interval);
+                }
+            }, [view, isAuthenticated, devMode]);
+
+            const sendCommand = async (doorId, cmd) => {
+                const endpoints = {
+                    unlock: `/unlock/${doorId}`,
+                    hold_today: `/hold/today/${doorId}`,
+                    hold_forever: `/hold/forever/${doorId}`,
+                    stop_hold: `/hold/stop/${doorId}`
+                };
+                await authFetch(endpoints[cmd], { method: 'POST' });
+                fetchDoors();
+            };
+
+            // Show loading while checking auth
+            if (authLoading) {
+                return <FullPageLoading />;
+            }
+
+            // Show login if not authenticated (and not in dev mode)
+            if (!isAuthenticated && !devMode) {
+                // Check if user exists but is pending approval
+                if (user && user.status === 'unapproved') {
+                    return <PendingApprovalScreen />;
+                }
+                return <LoginScreen />;
+            }
+
+            if (loading) return <FullPageLoading />;
+
+            return (
+                <div className="space-y-6">
+                    {/* Header */}
+                    <div className="flex justify-between items-center px-1 py-2">
+                        <button
+                            onClick={() => { checkConfig(); setView('dashboard'); }}
+                            className="text-left hover:opacity-70 transition-opacity"
+                        >
+                            <h1 className="text-xl font-bold text-gray-900 tracking-tight">{config.site_name}</h1>
+                            <p className="text-xs text-gray-500 font-medium uppercase tracking-wide mt-0.5">{config.site_timezone || ''}</p>
+                        </button>
+
+                        <ProfileDropdown
+                            user={user}
+                            isConnected={config.connected}
+                            onSettingsClick={() => setView('setup')}
+                            onSignOut={signOut}
+                        />
+                    </div>
+
+                    {view === 'setup' ? (
+                        <SetupForm onClose={() => { checkConfig(); setView('dashboard'); }} initialConfig={config} isAdmin={(user && user.isAdmin)} />
+                    ) : (
+                        <div className="space-y-3">
+                            {doors.map(door => (
+                                <DoorRow key={door.id} door={door} onCommand={sendCommand} isPast6pm={config.is_past_6pm} />
+                            ))}
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        function DoorRow({ door, onCommand, isPast6pm }) {
+            const [isProcessing, setIsProcessing] = useState(false);
+            const [optimisticState, setOptimisticState] = useState({
+                isHeld: door.is_held,
+                holdState: door.hold_state,
+                isUnlocked: false,
+                pendingCloseUntil: null
+            });
+
+            useEffect(() => {
+                // If we're in a pending close window, only accept updates that confirm "locked"
+                const now = Date.now();
+                const pendingClose = optimisticState.pendingCloseUntil && now < optimisticState.pendingCloseUntil;
+                const serverShowsLocked = !door.is_held && !(door.status && door.status.toLowerCase().includes("unlock"));
+
+                if (pendingClose && !serverShowsLocked) {
+                    // Ignore this update - still waiting for door to lock
+                    return;
+                }
+
+                setOptimisticState({
+                    isHeld: door.is_held,
+                    holdState: door.hold_state,
+                    isUnlocked: false,
+                    pendingCloseUntil: null
+                });
+            }, [door.is_held, door.hold_state, door.status]);
+
+            const handle = async (action) => {
+                if (isProcessing) return;
+                // Don't allow hold_today if past 6 PM
+                if (action === 'hold_today' && isPast6pm) return;
+                setIsProcessing(true);
+
+                // Optimistic updates
+                if (action === 'unlock') setOptimisticState(s => ({ ...s, isUnlocked: true, pendingCloseUntil: null }));
+                if (action === 'hold_today') setOptimisticState({ isHeld: true, holdState: 'hold_today', isUnlocked: false, pendingCloseUntil: null });
+                if (action === 'hold_forever') setOptimisticState({ isHeld: true, holdState: 'hold_forever', isUnlocked: false, pendingCloseUntil: null });
+                // For stop_hold, show locked immediately but ignore "open" updates for 20 seconds
+                if (action === 'stop_hold') setOptimisticState({ isHeld: false, holdState: null, isUnlocked: false, pendingCloseUntil: Date.now() + 20000 });
+
+                try {
+                    await onCommand(door.id, action);
+                } finally {
+                    setIsProcessing(false);
+                }
+            };
+
+            const isHeld = optimisticState.isHeld;
+            const holdState = optimisticState.holdState;
+            const optimisticUnlock = optimisticState.isUnlocked;
+            const pendingClose = optimisticState.pendingCloseUntil && Date.now() < optimisticState.pendingCloseUntil;
+
+            // Format expiry time for display
+            const getExpiryDisplay = () => {
+                if (!isHeld || !door.expires_at) return null;
+                if (holdState === 'hold_forever') return 'forever';
+                const expiry = new Date(door.expires_at * 1000);
+                return formatTimeShort(expiry.getHours(), expiry.getMinutes());
+            };
+            const expiryDisplay = getExpiryDisplay();
+
+            // Handle setting custom end time
+            const handleSetCustomTime = async (time) => {
+                setIsProcessing(true);
+                setOptimisticState({ isHeld: true, holdState: 'hold_today' });
+
+                try {
+                    const res = await authFetch(`/hold/today/${door.id}`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ end_time: time })
+                    });
+
+                    if (!res.ok) {
+                        throw new Error('Failed to update hold time');
+                    }
+
+                    // Trigger refresh to get new expiry time
+                    await onCommand(door.id, 'refresh');
+                } catch (err) {
+                    console.error(err);
+                } finally {
+                    setIsProcessing(false);
+                }
+            };
+
+            // Time picker modal state
+            const [showTimePicker, setShowTimePicker] = React.useState(false);
+            const [pickerHour, setPickerHour] = React.useState(6);
+            const [pickerMinute, setPickerMinute] = React.useState('00');
+            const [pickerPeriod, setPickerPeriod] = React.useState('PM');
+
+            // Open time picker modal
+            const openTimePicker = () => {
+                // Get current expiry time for initial selection
+                const expiry = door.expires_at ? new Date(door.expires_at * 1000) : new Date();
+                const currentHour = expiry.getHours();
+                const currentMin = expiry.getMinutes();
+                const isPM = currentHour >= 12;
+                const displayHour = currentHour % 12 || 12;
+                const nearestMin = Math.round(currentMin / 15) * 15 % 60;
+
+                setPickerHour(displayHour);
+                setPickerMinute(String(nearestMin).padStart(2, '0'));
+                setPickerPeriod(isPM ? 'PM' : 'AM');
+                setShowTimePicker(true);
+            };
+
+            // Confirm time picker selection
+            const confirmTimePicker = () => {
+                let hour24 = pickerHour;
+                if (pickerPeriod === 'PM' && pickerHour !== 12) hour24 += 12;
+                if (pickerPeriod === 'AM' && pickerHour === 12) hour24 = 0;
+
+                const timeStr = `${String(hour24).padStart(2, '0')}:${pickerMinute}`;
+                setShowTimePicker(false);
+                handleSetCustomTime(timeStr);
+            };
+
+            // Determine display status
+            const displayStatus = isHeld ? door.hold_status : door.status;
+            const isUnlocked = displayStatus && displayStatus.toLowerCase().includes("unlock");
+            // If pending close, show as locked; otherwise use normal logic
+            const isOpen = pendingClose ? false : (isHeld || isUnlocked || optimisticUnlock);
+
+            // Consistent Theme: Green = Open, Red = Locked
+            let themeColor = isOpen ? "green" : "red";
+            if (!door.is_online) themeColor = "gray";
+
+            return (
+            <React.Fragment>
+                <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-4 flex flex-col gap-4 transition-all duration-300">
+                    {/* Top Row: Info */}
+                    <div className="flex justify-between items-center">
+                        <div className="flex items-center gap-4">
+                            {/* Thumbnail / Icon */}
+                            {door.imageUrl && door.imageUrl.startsWith('/door-image/') ? (
+                                <div className="w-24 h-14 rounded-lg bg-gray-100 overflow-hidden flex-shrink-0 border border-gray-200 shadow-sm">
+                                    <img src={door.imageUrl} alt={door.name} className="w-full h-full object-cover" />
+                                </div>
+                            ) : (
+                                <div className={`h-12 w-12 rounded-full flex-shrink-0 flex items-center justify-center transition-colors duration-500 bg-${themeColor}-100 text-${themeColor}-600`}>
+                                    <div className="relative w-6 h-6">
+                                        {/* Lock Body */}
+                                        <LockIcon locked={true} className={`absolute inset-0 w-full h-full transition-opacity duration-300 ${isOpen ? 'opacity-0 scale-75' : 'opacity-100 scale-100'}`} />
+                                        {/* Unlocked Body */}
+                                        <LockIcon locked={false} className={`absolute inset-0 w-full h-full transition-opacity duration-300 ${isOpen ? 'opacity-100 scale-100' : 'opacity-0 scale-75'}`} />
+                                    </div>
+                                </div>
+                            )}
+
+                            <div>
+                                <h3 className="font-bold text-gray-900 text-lg leading-tight">{door.name}</h3>
+                                <p className={`text-xs font-medium transition-colors duration-300 ${isOpen ? 'text-green-700' : (!door.is_online ? 'text-gray-600' : 'text-red-700')}`}>
+                                    {isOpen
+                                        ? (holdState === 'hold_forever'
+                                            ? "Open · forever"
+                                            : (holdState === 'hold_today' && expiryDisplay
+                                                ? <span
+                                                    onClick={() => openTimePicker()}
+                                                    className="cursor-pointer underline decoration-dotted underline-offset-2 hover:text-green-800 active:text-green-900"
+                                                  >
+                                                    Open · until {expiryDisplay}
+                                                  </span>
+                                                : "Open"))
+                                        : (!door.is_online ? "Offline" : "Locked")}
+                                </p>
+                            </div>
+                        </div>
+                        {isProcessing && <Spinner size="sm" />}
+                    </div>
+
+                    {/* Bottom Row: Actions */}
+                    <div className="flex flex-col gap-1">
+                        <div className="bg-gray-100 p-2 rounded-lg flex flex-col items-center justify-center text-sm font-medium text-gray-600 relative h-auto">
+                            <label className="text-xs font-bold text-gray-700 uppercase tracking-wide mb-1.5">Open</label>
+                            <div className="flex w-full gap-1 items-stretch">
+                                {/* Action: Once */}
+                                <button
+                                    onClick={() => handle('unlock')}
+                                    className="flex-1 py-1.5 rounded-md transition-all hover:text-gray-900 bg-white border border-gray-200 active:bg-green-200 active:border-green-300 active:text-green-800">
+                                    Once
+                                </button>
+
+                                {/* Mode: Until time (Toggle) - after 6 PM opens time picker */}
+                                <button
+                                    onClick={() => {
+                                        if (holdState === 'hold_today') {
+                                            handle('stop_hold');
+                                        } else if (isPast6pm) {
+                                            openTimePicker();
+                                        } else {
+                                            handle('hold_today');
+                                        }
+                                    }}
+                                    className={`flex-1 py-1.5 rounded-md transition-all border ${holdState === 'hold_today' ? 'bg-green-200 text-green-800 border-green-300' : 'bg-white text-gray-600 border-gray-200 hover:bg-gray-50'}`}>
+                                    {holdState === 'hold_today' && expiryDisplay ? `Until ${expiryDisplay}` : (isPast6pm ? 'Until...' : `Until ${DEFAULT_END_TIME_DISPLAY}`)}
+                                </button>
+
+                                {/* Mode: Forever (Toggle) */}
+                                <button
+                                    onClick={() => handle(holdState === 'hold_forever' ? 'stop_hold' : 'hold_forever')}
+                                    className={`flex-1 py-1.5 rounded-md transition-all border ${holdState === 'hold_forever' ? 'bg-green-200 text-green-800 border-green-300' : 'bg-white text-gray-600 border-gray-200 hover:bg-gray-50'}`}>
+                                    Forever
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                {/* Time Picker Modal */}
+                {showTimePicker && (
+                    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50" onClick={() => setShowTimePicker(false)}>
+                        <div className="bg-white rounded-2xl p-6 mx-4 shadow-xl max-w-xs w-full" onClick={e => e.stopPropagation()}>
+                            <h3 className="text-lg font-semibold text-gray-900 mb-4 text-center">Set End Time</h3>
+                            <div className="flex gap-2 justify-center mb-6">
+                                {/* Hour */}
+                                <select
+                                    value={pickerHour}
+                                    onChange={e => setPickerHour(parseInt(e.target.value))}
+                                    className={STYLES.selectLarge}
+                                >
+                                    {HOURS_12.map(h => (
+                                        <option key={h} value={h}>{h}</option>
+                                    ))}
+                                </select>
+                                <span className="text-2xl font-medium self-center">:</span>
+                                {/* Minute */}
+                                <select
+                                    value={pickerMinute}
+                                    onChange={e => setPickerMinute(e.target.value)}
+                                    className={STYLES.selectLarge}
+                                >
+                                    {MINUTES_15.map(m => (
+                                        <option key={m} value={m}>{m}</option>
+                                    ))}
+                                </select>
+                                {/* AM/PM */}
+                                <select
+                                    value={pickerPeriod}
+                                    onChange={e => setPickerPeriod(e.target.value)}
+                                    className={STYLES.selectLarge}
+                                >
+                                    <option value="AM">AM</option>
+                                    <option value="PM">PM</option>
+                                </select>
+                            </div>
+                            <div className="flex gap-3">
+                                <button
+                                    onClick={() => setShowTimePicker(false)}
+                                    className="flex-1 py-2.5 rounded-xl border border-gray-300 text-gray-700 font-medium hover:bg-gray-50"
+                                >
+                                    Cancel
+                                </button>
+                                <button
+                                    onClick={confirmTimePicker}
+                                    className="flex-1 py-2.5 rounded-xl bg-blue-600 text-white font-medium hover:bg-blue-700"
+                                >
+                                    Set Time
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                )}
+            </React.Fragment>
+            );
+        }
+
+        function DeviceDebugPanel({ deviceId, deviceName }) {
+            const [debugData, setDebugData] = useState(null);
+            const [loading, setLoading] = useState(false);
+            const [expanded, setExpanded] = useState(false);
+            const [showRawJson, setShowRawJson] = useState(false);
+
+            const fetchDebug = async () => {
+                if (debugData) return;
+                setLoading(true);
+                try {
+                    const res = await authFetch(`/debug/${deviceId}`);
+                    const data = await res.json();
+                    setDebugData(data);
+                } catch (err) {
+                    console.error('Failed to fetch debug info:', err);
+                    setDebugData({ error: err.message });
+                } finally {
+                    setLoading(false);
+                }
+            };
+
+            const toggleExpand = () => {
+                if (!expanded) fetchDebug();
+                setExpanded(!expanded);
+            };
+
+            const formatTimestamp = (ts) => {
+                if (!ts) return '—';
+                const d = new Date(ts * 1000);
+                return d.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+            };
+
+            // Extract useful info from debug data
+            const getPhysicalDevice = () => {
+                if (!debugData || !debugData.unifi || !debugData.unifi.physical_device) return null;
+                const dev = debugData.unifi.physical_device;
+                return {
+                    name: dev.name || '—',
+                    type: dev.device_type || '—',
+                    model: dev.model || '—',
+                    firmware: dev.firmware || '—',
+                    ip: dev.ip || '—',
+                    mac: dev.mac || '—',
+                    isOnline: dev.is_online,
+                    isConnected: dev.is_connected,
+                    hwType: dev.hw_type || '—'
+                };
+            };
+
+            const getDoorInfo = () => {
+                if (!debugData || !debugData.unifi || !debugData.unifi.door) return null;
+                const door = debugData.unifi.door;
+                return {
+                    name: door.name || '—',
+                    fullName: door.full_name || '—',
+                    floor: door.floor || '—',
+                    uniqueId: door.unique_id || '—'
+                };
+            };
+
+            const getScheduleInfo = () => {
+                if (!debugData || !debugData.unifi || !debugData.unifi.schedule || !debugData.unifi.schedule.schedule_info) return null;
+                const info = debugData.unifi.schedule.schedule_info;
+                const weekSchedule = (info.user_timezone && info.user_timezone.week_schedule) || {};
+                return {
+                    name: info.name,
+                    type: info.type,
+                    isPrivate: info.is_private,
+                    weekSchedule
+                };
+            };
+
+            const getHardwareStatus = () => {
+                return (debugData && debugData.unifi && debugData.unifi.hardware_status) || null;
+            };
+
+            const getLocalState = () => {
+                return (debugData && debugData.local && debugData.local.hold_state) || null;
+            };
+
+            const getJournalEntries = () => {
+                return (debugData && debugData.local && debugData.local.journal_entries) || [];
+            };
+
+            const getWebsocketInfo = () => {
+                return (debugData && debugData.websocket) || { connected: false, recent_events: [] };
+            };
+
+            return (
+                <div className="border border-gray-200 rounded-lg overflow-hidden">
+                    <button
+                        onClick={toggleExpand}
+                        className="w-full flex justify-between items-center px-4 py-3 bg-gray-50 hover:bg-gray-100 transition-colors"
+                    >
+                        <span className="font-medium text-gray-900 text-sm">{deviceName}</span>
+                        <span className="text-gray-400 text-xs">{expanded ? '▼' : '▶'} Debug</span>
+                    </button>
+
+                    {expanded && (
+                        <div className="p-4 bg-white border-t border-gray-100 space-y-4">
+                            {loading ? (
+                                <LoadingSpinner size="sm" />
+                            ) : debugData ? (
+                                <React.Fragment>
+                                    {/* WebSocket Status */}
+                                    <div className={`rounded-lg p-3 ${getWebsocketInfo().connected ? 'bg-purple-50' : 'bg-gray-100'}`}>
+                                        <h4 className={`text-xs font-bold uppercase tracking-wide mb-2 flex items-center gap-2 ${getWebsocketInfo().connected ? 'text-purple-700' : 'text-gray-500'}`}>
+                                            Real-Time Events
+                                            {getWebsocketInfo().connected ? (
+                                                <StatusBadge active={true} label="Connected" />
+                                            ) : (
+                                                <StatusBadge active={false} label="Disconnected" />
+                                            )}
+                                        </h4>
+                                        {getWebsocketInfo().recent_events && getWebsocketInfo().recent_events.length > 0 ? (
+                                            <div className="space-y-1 max-h-32 overflow-y-auto">
+                                                {getWebsocketInfo().recent_events.map((evt, idx) => (
+                                                    <div key={idx} className="flex items-center gap-2 text-xs py-1 border-b border-purple-100 last:border-0">
+                                                        <span className="px-1.5 py-0.5 rounded font-medium bg-purple-100 text-purple-700 text-[10px]">
+                                                            {(evt.event || '').replace('access.data.', '').replace('access.', '')}
+                                                        </span>
+                                                        <span className="text-gray-400 ml-auto text-[10px]">
+                                                            {(evt._received_at || '').slice(11, 19)}
+                                                        </span>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        ) : (
+                                            <p className="text-gray-500 text-xs">No recent events for this device</p>
+                                        )}
+                                    </div>
+
+                                    {/* Hardware Signals */}
+                                    {getHardwareStatus() && (
+                                        <div className="bg-yellow-50 rounded-lg p-3">
+                                            <h4 className="text-xs font-bold text-yellow-700 uppercase tracking-wide mb-2">Hardware Signals (Polled)</h4>
+                                            <div className="grid grid-cols-2 gap-2">
+                                                <div className="bg-white rounded p-2 text-center">
+                                                    <div className="text-[10px] text-gray-500 uppercase">Lock Relay</div>
+                                                    <div className={`text-sm font-bold ${getHardwareStatus().door_lock_relay_status === 'unlock' ? 'text-green-600' : 'text-red-600'}`}>
+                                                        {getHardwareStatus().door_lock_relay_status === 'unlock' ? 'UNLOCKED' : 'LOCKED'}
+                                                    </div>
+                                                </div>
+                                                <div className="bg-white rounded p-2 text-center">
+                                                    <div className="text-[10px] text-gray-500 uppercase">Position Sensor</div>
+                                                    <div className={`text-sm font-bold ${getHardwareStatus().door_position_status === 'open' ? 'text-green-600' : 'text-gray-600'}`}>
+                                                        {getHardwareStatus().door_position_status === 'open' ? 'OPEN' : 'CLOSED'}
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {/* Physical Device (Hardware) */}
+                                    {getPhysicalDevice() && (
+                                        <div className={STYLES.infoSection}>
+                                            <h4 className={`${STYLES.sectionHeader} text-gray-700 flex items-center gap-2`}>
+                                                Physical Device
+                                                {getPhysicalDevice().isOnline ? (
+                                                    <StatusBadge active={true} label="Online" />
+                                                ) : (
+                                                    <StatusBadge active={false} label="Offline" />
+                                                )}
+                                            </h4>
+                                            <div className="space-y-0">
+                                                <InfoRow label="Name" value={getPhysicalDevice().name} />
+                                                <InfoRow label="Type" value={getPhysicalDevice().type} />
+                                                <InfoRow label="Model" value={getPhysicalDevice().model} />
+                                                <InfoRow label="Firmware" value={getPhysicalDevice().firmware} mono />
+                                                <InfoRow label="IP" value={getPhysicalDevice().ip} mono />
+                                                <InfoRow label="MAC" value={getPhysicalDevice().mac} mono />
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {/* Door Info */}
+                                    {getDoorInfo() && (
+                                        <div className={STYLES.infoSection}>
+                                            <h4 className={`${STYLES.sectionHeader} text-gray-700`}>
+                                                Door
+                                            </h4>
+                                            <div className="space-y-0">
+                                                <InfoRow label="Name" value={getDoorInfo().name} />
+                                                <InfoRow label="Full Name" value={getDoorInfo().fullName} />
+                                                <InfoRow label="Floor" value={getDoorInfo().floor} />
+                                                <InfoRow label="ID" value={getDoorInfo().uniqueId} mono />
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {/* Schedule Info */}
+                                    {getScheduleInfo() && (
+                                        <div className="bg-blue-50 rounded-lg p-3">
+                                            <h4 className={`${STYLES.sectionHeader} text-blue-700`}>UniFi Schedule</h4>
+                                            <div className="space-y-0 mb-3">
+                                                <InfoRow label="Name" value={getScheduleInfo().name} mono />
+                                                <InfoRow label="Type" value={getScheduleInfo().type} />
+                                            </div>
+                                            <div className="text-xs">
+                                                <span className="font-medium text-gray-700">Week Schedule:</span>
+                                                <div className="mt-1 grid grid-cols-7 gap-1">
+                                                    {DAY_NAMES.map((day, idx) => {
+                                                        const blocks = getScheduleInfo().weekSchedule[String(idx)] || [];
+                                                        const hasBlocks = blocks.length > 0;
+                                                        return (
+                                                            <div key={idx} className={`text-center p-1.5 rounded ${hasBlocks ? 'bg-blue-200 text-blue-800' : 'bg-gray-100 text-gray-400'}`}>
+                                                                <div className="font-medium">{day}</div>
+                                                                {hasBlocks && blocks.map((b, i) => (
+                                                                    <div key={i} className="text-[10px] mt-0.5 font-mono">
+                                                                        {(b.start_time || '').slice(0,5)}-{(b.end_time || '').slice(0,5)}
+                                                                    </div>
+                                                                ))}
+                                                            </div>
+                                                        );
+                                                    })}
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {/* Local State */}
+                                    <div className={`rounded-lg p-3 ${getLocalState() ? 'bg-green-50' : 'bg-gray-50'}`}>
+                                        <h4 className={`${STYLES.sectionHeader} ${getLocalState() ? 'text-green-700' : 'text-gray-700'}`}>
+                                            Local Hold State
+                                        </h4>
+                                        {getLocalState() ? (
+                                            <div className="space-y-0">
+                                                <InfoRow label="State" value={getLocalState().state} />
+                                                <InfoRow label="Created" value={formatTimestamp(getLocalState().created_at)} />
+                                                <InfoRow label="Expires" value={getLocalState().expires_at ? formatTimestamp(getLocalState().expires_at) : 'Never'} />
+                                                {getLocalState().schedule_block && (
+                                                    <InfoRow
+                                                        label="Block"
+                                                        value={`Day ${getLocalState().schedule_block.day}: ${(getLocalState().schedule_block.start_time || '').slice(0,5)}-${(getLocalState().schedule_block.end_time || '').slice(0,5)}`}
+                                                        mono
+                                                    />
+                                                )}
+                                            </div>
+                                        ) : (
+                                            <p className="text-gray-500 text-xs">No active hold</p>
+                                        )}
+                                    </div>
+
+                                    {/* Journal Entries */}
+                                    {getJournalEntries().length > 0 && (
+                                        <div className={STYLES.infoSection}>
+                                            <h4 className={`${STYLES.sectionHeader} text-gray-700`}>
+                                                Recent Journal ({getJournalEntries().length})
+                                            </h4>
+                                            <div className="space-y-1 max-h-32 overflow-y-auto">
+                                                {getJournalEntries().map((entry, idx) => (
+                                                    <div key={idx} className="flex items-center gap-2 text-xs py-1 border-b border-gray-100 last:border-0">
+                                                        <span className={`px-1.5 py-0.5 rounded font-medium ${entry.action === 'create' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
+                                                            {entry.action}
+                                                        </span>
+                                                        <span className="text-gray-600 font-mono">
+                                                            Day {entry.day} {(entry.start_time || '').slice(0,5)}-{(entry.end_time || '').slice(0,5)}
+                                                        </span>
+                                                        <span className="text-gray-400 ml-auto">
+                                                            {(entry.timestamp || '').slice(11,16)}
+                                                        </span>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {/* Raw JSON Toggle */}
+                                    <button
+                                        onClick={() => setShowRawJson(!showRawJson)}
+                                        className="text-xs text-gray-400 hover:text-gray-600"
+                                    >
+                                        {showRawJson ? '▼ Hide' : '▶ Show'} Raw JSON
+                                    </button>
+                                    {showRawJson && (
+                                        <pre className="bg-gray-100 p-3 rounded-lg text-[10px] font-mono text-gray-600 overflow-x-auto max-h-64 overflow-y-auto whitespace-pre-wrap break-all">
+                                            {JSON.stringify(debugData, null, 2)}
+                                        </pre>
+                                    )}
+                                </React.Fragment>
+                            ) : (
+                                <p className="text-gray-500 text-sm">No data</p>
+                            )}
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        function DoorsDebugList() {
+            const [doors, setDoors] = useState([]);
+            const [loading, setLoading] = useState(true);
+
+            useEffect(() => {
+                const fetchDoors = async () => {
+                    try {
+                        const res = await authFetch('/devices');
+                        const data = await res.json();
+                        if (Array.isArray(data)) {
+                            setDoors(data);
+                        } else {
+                            console.error('Devices response not an array:', data);
+                            setDoors([]);
+                        }
+                    } catch (err) {
+                        console.error('Failed to fetch doors:', err);
+                    } finally {
+                        setLoading(false);
+                    }
+                };
+                fetchDoors();
+            }, []);
+
+            if (loading) {
+                return (
+                    <div className={STYLES.cardWithPadding}>
+                        <h2 className="text-lg font-bold text-gray-900 mb-4">Device Debug</h2>
+                        <LoadingSpinner />
+                    </div>
+                );
+            }
+
+            return (
+                <div className={STYLES.cardWithPadding}>
+                    <h2 className="text-lg font-bold text-gray-900 mb-4">Device Debug</h2>
+                    <div className="space-y-2">
+                        {doors.map(door => (
+                            <DeviceDebugPanel key={door.id} deviceId={door.id} deviceName={door.name} />
+                        ))}
+                    </div>
+                </div>
+            );
+        }
+
+        function ActivityLog() {
+            const [events, setEvents] = useState([]);
+            const [loading, setLoading] = useState(true);
+            const [expanded, setExpanded] = useState(false);
+
+            useEffect(() => {
+                const fetchEvents = async () => {
+                    try {
+                        const res = await authFetch('/events?limit=50');
+                        const data = await res.json();
+                        if (Array.isArray(data)) {
+                            setEvents(data);
+                        } else {
+                            console.error('Events response not an array:', data);
+                            setEvents([]);
+                        }
+                    } catch (err) {
+                        console.error('Failed to fetch events:', err);
+                    } finally {
+                        setLoading(false);
+                    }
+                };
+                fetchEvents();
+            }, []);
+
+            const formatTime = (timestamp) => {
+                const date = new Date(timestamp);
+                const now = new Date();
+                const isToday = date.toDateString() === now.toDateString();
+                if (isToday) {
+                    return date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+                }
+                return date.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' +
+                       date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+            };
+
+            // Event type to label mapping
+            const EVENT_LABELS = {
+                unlock: 'Opened once',
+                hold_today: 'Held open',
+                hold_forever: 'Held open forever',
+                stop_hold: 'Released hold',
+                login_success: 'Logged in',
+                orphan_cleanup: 'Auto cleanup',
+                sync: 'Sync',
+                ws_unlock: 'Unlocked',
+                ws_lock: 'Locked',
+                ws_rex: 'REX pressed',
+                ws_door_position: 'Door moved',
+                ws_entry: 'Entry',
+                ws_exit: 'Exit'
+            };
+
+            // Event type to icon mapping (uses LockIcon for lock-related events)
+            const EventIcon = ({ event }) => {
+                const className = "w-4 h-4 text-gray-400";
+
+                // Use reusable LockIcon for lock-related events
+                if (event === 'unlock' || event === 'ws_unlock') {
+                    return <LockIcon locked={false} className={className} />;
+                }
+                if (event === 'stop_hold' || event === 'ws_lock') {
+                    return <LockIcon locked={true} className={className} />;
+                }
+                if (event === 'hold_today') {
+                    return <ClockIcon className={className} />;
+                }
+
+                // Other icons with unique paths
+                const iconPaths = {
+                    hold_forever: "M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15",
+                    login_success: "M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z",
+                    orphan_cleanup: "M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16",
+                    sync: "M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15",
+                    ws_rex: "M15 15l-2 5L9 9l11 4-5 2zm0 0l5 5M7.188 2.239l.777 2.897M5.136 7.965l-2.898-.777M13.95 4.05l-2.122 2.122m-5.657 5.656l-2.12 2.122",
+                    ws_door_position: "M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6",
+                    ws_entry: "M11 16l-4-4m0 0l4-4m-4 4h14m-5 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h7a3 3 0 013 3v1",
+                    ws_exit: "M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"
+                };
+
+                const path = iconPaths[event];
+                if (path) {
+                    return (
+                        <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={path} />
+                        </svg>
+                    );
+                }
+
+                // Default dot icon
+                return <svg className={className} fill="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4" /></svg>;
+            };
+
+            const getEventLabel = (event) => EVENT_LABELS[event] || event;
+
+            const displayEvents = expanded ? events : events.slice(0, 5);
+
+            return (
+                <div className={STYLES.cardWithPadding}>
+                    <h2 className="text-lg font-bold text-gray-900 mb-4">Activity Log</h2>
+
+                    {loading ? (
+                        <LoadingSpinner />
+                    ) : events.length === 0 ? (
+                        <p className="text-gray-500 text-sm text-center py-4">No activity yet</p>
+                    ) : (
+                        <div className="space-y-2">
+                            {displayEvents.map((evt, idx) => (
+                                <div key={idx} className="flex items-start gap-3 py-2 border-b border-gray-50 last:border-0">
+                                    <div className="mt-0.5"><EventIcon event={evt.event} /></div>
+                                    <div className="flex-1 min-w-0">
+                                        <div className="flex justify-between items-baseline">
+                                            <span className="font-medium text-gray-900 text-sm">
+                                                {getEventLabel(evt.event)}
+                                                {evt.details && <span className="text-gray-500 font-normal"> {evt.details}</span>}
+                                            </span>
+                                            <span className="text-xs text-gray-400 ml-2 whitespace-nowrap">{formatTime(evt.timestamp)}</span>
+                                        </div>
+                                        <div className="text-xs text-gray-500 truncate">
+                                            {evt.device_name || evt.device_id || ''}{evt.device_name && evt.user && evt.user !== 'system' ? ' · ' : ''}{evt.user !== 'system' ? evt.user : ''}
+                                        </div>
+                                    </div>
+                                </div>
+                            ))}
+
+                            {events.length > 5 && (
+                                <button
+                                    onClick={() => setExpanded(!expanded)}
+                                    className="w-full text-center text-xs text-blue-600 hover:text-blue-800 py-2"
+                                >
+                                    {expanded ? 'Show less' : `Show ${events.length - 5} more`}
+                                </button>
+                            )}
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // =========== User Management (Admin Only) ===========
+        function UserManagement() {
+            const [users, setUsers] = useState([]);
+            const [invites, setInvites] = useState([]);
+            const [loading, setLoading] = useState(true);
+            const [inviteEmail, setInviteEmail] = useState('');
+            const [autoApprove, setAutoApprove] = useState(true);
+            const [addMode, setAddMode] = useState('direct'); // 'direct' or 'invite'
+            const [inviteStatus, setInviteStatus] = useState('');
+            const [inviteUrl, setInviteUrl] = useState('');
+
+            const fetchUsers = async () => {
+                try {
+                    const res = await authFetch('/admin/users');
+                    if (res.ok) {
+                        const data = await res.json();
+                        setUsers(data.users || []);
+                    }
+                } catch (err) {
+                    console.error('Failed to fetch users:', err);
+                }
+            };
+
+            const fetchInvites = async () => {
+                try {
+                    const res = await authFetch('/admin/invites');
+                    if (res.ok) {
+                        const data = await res.json();
+                        setInvites(data.invites || []);
+                    }
+                } catch (err) {
+                    console.error('Failed to fetch invites:', err);
+                }
+            };
+
+            useEffect(() => {
+                const load = async () => {
+                    await Promise.all([fetchUsers(), fetchInvites()]);
+                    setLoading(false);
+                };
+                load();
+            }, []);
+
+            const handleAddUser = async (e) => {
+                e.preventDefault();
+                setInviteStatus(addMode === 'direct' ? 'Adding...' : 'Sending...');
+                setInviteUrl('');
+
+                try {
+                    const endpoint = addMode === 'direct' ? '/admin/users/add' : '/admin/invite';
+                    const body = addMode === 'direct'
+                        ? { email: inviteEmail }
+                        : { email: inviteEmail, auto_approve: autoApprove };
+
+                    const res = await authFetch(endpoint, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body)
+                    });
+                    const data = await res.json();
+
+                    if (res.ok) {
+                        setInviteStatus(data.message || 'Success!');
+                        if (data.invite_url) {
+                            setInviteUrl(data.invite_url);
+                        }
+                        setInviteEmail('');
+                        if (addMode === 'direct') {
+                            fetchUsers();
+                        } else {
+                            fetchInvites();
+                        }
+                    } else {
+                        setInviteStatus('Error: ' + (data.error || 'Failed'));
+                    }
+                } catch (err) {
+                    setInviteStatus('Network error');
+                }
+            };
+
+            const handleApprove = async (email) => {
+                try {
+                    const res = await authFetch(`/admin/users/${encodeURIComponent(email)}/approve`, {
+                        method: 'POST'
+                    });
+                    if (res.ok) {
+                        fetchUsers();
+                    }
+                } catch (err) {
+                    console.error('Failed to approve user:', err);
+                }
+            };
+
+            const handleApproveInvite = async (token) => {
+                try {
+                    const res = await authFetch(`/admin/invites/${token}/approve`, {
+                        method: 'POST'
+                    });
+                    if (res.ok) {
+                        fetchInvites();
+                    }
+                } catch (err) {
+                    console.error('Failed to approve invite:', err);
+                }
+            };
+
+            const handleReject = async (email) => {
+                try {
+                    const res = await authFetch(`/admin/users/${encodeURIComponent(email)}/reject`, {
+                        method: 'POST'
+                    });
+                    if (res.ok) {
+                        fetchUsers();
+                    }
+                } catch (err) {
+                    console.error('Failed to reject user:', err);
+                }
+            };
+
+            const handleChangeRole = async (email, newRole) => {
+                try {
+                    const res = await authFetch(`/admin/users/${encodeURIComponent(email)}/role`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ role: newRole })
+                    });
+                    if (res.ok) {
+                        fetchUsers();
+                    }
+                } catch (err) {
+                    console.error('Failed to change role:', err);
+                }
+            };
+
+            if (loading) {
+                return (
+                    <div className={STYLES.cardWithPadding}>
+                        <h2 className="text-lg font-bold text-gray-900 mb-4">User Management</h2>
+                        <LoadingSpinner />
+                    </div>
+                );
+            }
+
+            return (
+                <div className={`${STYLES.cardWithPadding} space-y-6`}>
+                    <h2 className="text-lg font-bold text-gray-900">User Management</h2>
+
+                    {/* Add User Form */}
+                    <div className="border-b border-gray-100 pb-4">
+                        <div className="flex items-center gap-4 mb-2">
+                            <h3 className="text-sm font-semibold text-gray-700">Add User</h3>
+                            <div className="flex text-xs">
+                                <button
+                                    onClick={() => setAddMode('direct')}
+                                    className={`px-2 py-1 rounded-l border ${addMode === 'direct' ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-gray-600 border-gray-300'}`}
+                                >
+                                    Direct
+                                </button>
+                                <button
+                                    onClick={() => setAddMode('invite')}
+                                    className={`px-2 py-1 rounded-r border-t border-r border-b ${addMode === 'invite' ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-gray-600 border-gray-300'}`}
+                                >
+                                    Invite Link
+                                </button>
+                            </div>
+                        </div>
+                        <form onSubmit={handleAddUser} className="space-y-2">
+                            <div className="flex gap-2">
+                                <input
+                                    type="email"
+                                    placeholder="email@example.com"
+                                    value={inviteEmail}
+                                    onChange={(e) => setInviteEmail(e.target.value)}
+                                    className={`flex-1 ${STYLES.inputSmall}`}
+                                    required
+                                />
+                                <button
+                                    type="submit"
+                                    className="bg-blue-600 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-blue-700"
+                                >
+                                    {addMode === 'direct' ? 'Add User' : 'Send Invite'}
+                                </button>
+                            </div>
+                            {addMode === 'invite' && (
+                                <label className="flex items-center gap-2 text-sm text-gray-600">
+                                    <input
+                                        type="checkbox"
+                                        checked={autoApprove}
+                                        onChange={(e) => setAutoApprove(e.target.checked)}
+                                        className="rounded"
+                                    />
+                                    Auto-approve when they accept
+                                </label>
+                            )}
+                            {addMode === 'direct' && (
+                                <p className="text-xs text-gray-500">User will be approved immediately. They just need to sign in with this email.</p>
+                            )}
+                        </form>
+                        {inviteStatus && (
+                            <p className={`text-xs mt-2 ${inviteStatus.includes('Error') ? 'text-red-500' : 'text-green-600'}`}>
+                                {inviteStatus}
+                            </p>
+                        )}
+                        {inviteUrl && (
+                            <div className="mt-2 p-2 bg-gray-50 rounded text-xs">
+                                <span className="text-gray-500">Invite URL: </span>
+                                <code className="text-blue-600 break-all">{inviteUrl}</code>
+                            </div>
+                        )}
+                    </div>
+
+                    {/* Pending Invites */}
+                    {invites.length > 0 && (
+                        <div className="border-b border-gray-100 pb-4">
+                            <h3 className="text-sm font-semibold text-gray-700 mb-2">Pending Invites</h3>
+                            <div className="space-y-2">
+                                {invites.map((invite, idx) => (
+                                    <div key={idx} className="flex justify-between items-center py-2 border-b border-gray-50 last:border-0">
+                                        <div>
+                                            <span className="text-sm text-gray-900">{invite.email}</span>
+                                            <span className="text-xs text-gray-400 ml-2">by {invite.invited_by}</span>
+                                            {invite.auto_approve && (
+                                                <span className="ml-2 px-1.5 py-0.5 bg-green-100 text-green-700 text-xs rounded">pre-approved</span>
+                                            )}
+                                        </div>
+                                        <div className="flex items-center gap-2">
+                                            {!invite.auto_approve && (
+                                                <button
+                                                    onClick={() => handleApproveInvite(invite.token)}
+                                                    className="text-xs text-green-600 hover:text-green-800"
+                                                >
+                                                    Pre-approve
+                                                </button>
+                                            )}
+                                            <span className="text-xs text-gray-400">
+                                                expires {new Date(invite.expires_at).toLocaleDateString()}
+                                            </span>
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+
+                    {/* User List */}
+                    <div>
+                        <h3 className="text-sm font-semibold text-gray-700 mb-2">Users ({users.length})</h3>
+                        {users.length === 0 ? (
+                            <p className="text-sm text-gray-500">No users yet</p>
+                        ) : (
+                            <div className="space-y-2">
+                                {users.map((user, idx) => (
+                                    <div key={idx} className="flex justify-between items-center py-2 border-b border-gray-50 last:border-0">
+                                        <div className="flex items-center gap-2">
+                                            <span className="text-sm text-gray-900">{user.email}</span>
+                                            <RoleBadge role={user.role} />
+                                            <StatusBadge status={user.status} />
+                                        </div>
+                                        <div className="flex gap-2">
+                                            {user.status === 'pending' && (
+                                                <>
+                                                    <button
+                                                        onClick={() => handleApprove(user.email)}
+                                                        className="text-xs text-green-600 hover:text-green-800 font-medium"
+                                                    >
+                                                        Approve
+                                                    </button>
+                                                    <button
+                                                        onClick={() => handleReject(user.email)}
+                                                        className="text-xs text-red-600 hover:text-red-800 font-medium"
+                                                    >
+                                                        Reject
+                                                    </button>
+                                                </>
+                                            )}
+                                            {user.status === 'approved' && user.role !== 'admin' && (
+                                                <button
+                                                    onClick={() => handleChangeRole(user.email, 'admin')}
+                                                    className="text-xs text-purple-600 hover:text-purple-800 font-medium"
+                                                >
+                                                    Make Admin
+                                                </button>
+                                            )}
+                                            {user.status === 'approved' && user.role === 'admin' && (
+                                                <button
+                                                    onClick={() => handleChangeRole(user.email, 'user')}
+                                                    className="text-xs text-gray-600 hover:text-gray-800 font-medium"
+                                                >
+                                                    Remove Admin
+                                                </button>
+                                            )}
+                                            {user.status === 'rejected' && (
+                                                <button
+                                                    onClick={() => handleApprove(user.email)}
+                                                    className="text-xs text-green-600 hover:text-green-800 font-medium"
+                                                >
+                                                    Approve
+                                                </button>
+                                            )}
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        }
+
+        function SetupForm({ onClose, initialConfig, isAdmin }) {
+            const { signOut } = useAuth();
+            const [activeSection, setActiveSection] = useState('connection');
+            const [isEditing, setIsEditing] = useState(!(initialConfig && initialConfig.connected));
+            const [form, setForm] = useState({ host: '', username: 'admin', password: '', token: '', site_name: '' });
+            const [status, setStatus] = useState('');
+
+            useEffect(() => {
+                if(initialConfig) {
+                    setForm(f => ({
+                        ...f,
+                        host: initialConfig.host || f.host,
+                        username: initialConfig.username || f.username,
+                        site_name: initialConfig.site_name || f.site_name
+                    }));
+                    setIsEditing(!(initialConfig && initialConfig.connected));
+                }
+            }, [initialConfig]);
+
+            const handleSubmit = async (e) => {
+                e.preventDefault();
+                const isReconnect = !!form.password;
+                const hostChanged = initialConfig && form.host !== initialConfig.host;
+                const userChanged = initialConfig && form.username !== initialConfig.username;
+
+                if (!isReconnect && (hostChanged || userChanged)) {
+                    setStatus('Error: Password required to change Host or Username');
+                    return;
+                }
+
+                setStatus(isReconnect ? 'Connecting...' : 'Saving...');
+
+                try {
+                    const endpoint = isReconnect ? '/setup' : '/config/update';
+                    const res = await authFetch(endpoint, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(form)
+                    });
+                    const data = await res.json();
+                    if (res.ok) {
+                        setStatus('Success!');
+                        setIsEditing(false);
+                    } else {
+                        setStatus('Error: ' + data.message);
+                    }
+                } catch (err) {
+                    setStatus('Network Error');
+                }
+            };
+
+            // Section navigation tabs
+            const sections = [
+                { id: 'connection', label: 'Connection' },
+                ...(isAdmin ? [{ id: 'users', label: 'Users' }] : []),
+                { id: 'debug', label: 'Debug' },
+                { id: 'activity', label: 'Activity' },
+            ];
+
+            return (
+                <div className="space-y-4">
+                    {/* Settings Header with Close */}
+                    <div className="flex justify-between items-center">
+                        <h2 className="text-lg font-bold text-gray-900">Settings</h2>
+                        <button
+                            onClick={onClose}
+                            className="p-2 hover:bg-gray-100 rounded-lg transition-colors"
+                            aria-label="Close settings"
+                        >
+                            <CloseIcon className="w-5 h-5 text-gray-500" />
+                        </button>
+                    </div>
+
+                    {/* Section Tabs */}
+                    <div className="flex gap-1 bg-gray-100 p-1 rounded-lg">
+                        {sections.map(section => (
+                            <button
+                                key={section.id}
+                                onClick={() => setActiveSection(section.id)}
+                                className={`flex-1 py-2 px-3 text-xs font-medium rounded-md transition-colors ${
+                                    activeSection === section.id
+                                        ? 'bg-white text-gray-900 shadow-sm'
+                                        : 'text-gray-500 hover:text-gray-700'
+                                }`}
+                            >
+                                {section.label}
+                            </button>
+                        ))}
+                    </div>
+
+                    {/* Connection Section */}
+                    {activeSection === 'connection' && (
+                        <div className={`${STYLES.card} p-5`}>
+                            {!isEditing && initialConfig && initialConfig.connected ? (
+                                <div className="space-y-4">
+                                    <div className="space-y-2 text-sm">
+                                        <div className="flex justify-between py-2 border-b border-gray-100">
+                                            <span className="text-gray-500">Status</span>
+                                            <span className="text-green-600 font-semibold flex items-center gap-1">
+                                                <span className="h-2 w-2 rounded-full bg-green-500"></span> Connected
+                                            </span>
+                                        </div>
+                                        <div className="flex justify-between py-2 border-b border-gray-100">
+                                            <span className="text-gray-500">Site Name</span>
+                                            <span className="text-gray-900 font-medium">{initialConfig.site_name || 'Default'}</span>
+                                        </div>
+                                        <div className="flex justify-between py-2 border-b border-gray-100">
+                                            <span className="text-gray-500">Controller</span>
+                                            <span className="text-gray-900 font-mono text-xs">{initialConfig.host}</span>
+                                        </div>
+                                        <div className="flex justify-between py-2">
+                                            <span className="text-gray-500">Username</span>
+                                            <span className="text-gray-900 font-medium">{initialConfig.username}</span>
+                                        </div>
+                                    </div>
+                                    <button
+                                        onClick={() => setIsEditing(true)}
+                                        className={`w-full ${STYLES.btnSecondary}`}>
+                                        Edit Connection
+                                    </button>
+                                    <button
+                                        onClick={signOut}
+                                        className={`w-full ${STYLES.btnDanger} text-xs py-2`}>
+                                        Sign Out
+                                    </button>
+                                </div>
+                            ) : (
+                                <form onSubmit={handleSubmit} className="space-y-3">
+                                    {initialConfig && initialConfig.connected && (
+                                        <div className="flex justify-end">
+                                            <button type="button" onClick={() => setIsEditing(false)} className="text-gray-400 text-xs hover:text-gray-600">Cancel</button>
+                                        </div>
+                                    )}
+                                    <div>
+                                        <label className={STYLES.label}>Site Name</label>
+                                        <input type="text" placeholder="e.g. Home" className={STYLES.input} value={form.site_name} onChange={e => setForm({...form, site_name: e.target.value})} />
+                                    </div>
+                                    <div>
+                                        <label className={STYLES.label}>Controller Host</label>
+                                        <input required type="text" placeholder="192.168.1.1" className={STYLES.input} value={form.host} onChange={e => setForm({...form, host: e.target.value})} />
+                                    </div>
+                                    <div>
+                                        <label className={STYLES.label}>Username</label>
+                                        <input required type="text" placeholder="admin" className={STYLES.input} value={form.username} onChange={e => setForm({...form, username: e.target.value})} />
+                                    </div>
+                                    <div>
+                                        <label className={STYLES.label}>Password</label>
+                                        <input type="password" placeholder={initialConfig && initialConfig.connected ? "(Unchanged)" : "Password"} className={STYLES.input} value={form.password} onChange={e => setForm({...form, password: e.target.value})} />
+                                    </div>
+                                    <div>
+                                        <label className={STYLES.label}>2FA Code (Optional)</label>
+                                        <input type="text" placeholder="123456" className={STYLES.input} value={form.token} onChange={e => setForm({...form, token: e.target.value})} />
+                                    </div>
+                                    <button type="submit" className={`w-full ${STYLES.btnPrimary}`}>
+                                        {form.password ? "Connect" : "Save"}
+                                    </button>
+                                    {status && <p className={`text-center text-xs mt-2 ${status.includes('Success') ? 'text-green-500' : 'text-red-500'}`}>{status}</p>}
+                                </form>
+                            )}
+                        </div>
+                    )}
+
+                    {/* Users Section (Admin only) */}
+                    {activeSection === 'users' && isAdmin && <UserManagement />}
+
+                    {/* Debug Section */}
+                    {activeSection === 'debug' && <DoorsDebugList />}
+
+                    {/* Activity Section */}
+                    {activeSection === 'activity' && <ActivityLog />}
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(
+            <AuthProvider>
+                <App />
+            </AuthProvider>
+        );
+    {% endraw %}
+    </script>
+</body>
+</html>

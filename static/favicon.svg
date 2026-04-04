@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="28 24 52 56" width="32" height="32">
+  <!-- Shaker Gate Icon - Blue on white background -->
+  <rect x="28" y="24" width="52" height="56" fill="white" rx="4"/>
+
+  <!-- Gate frame -->
+  <path stroke="#5C6BC0" stroke-width="1.5" fill="none" d="M36,34 L72,34 L72,74 L36,74 Z"/>
+
+  <!-- Top rail -->
+  <path stroke="#5C6BC0" stroke-width="1.2" d="M36,40 L72,40"/>
+
+  <!-- Bottom rail -->
+  <path stroke="#5C6BC0" stroke-width="1.2" d="M36,68 L72,68"/>
+
+  <!-- Vertical slats -->
+  <path stroke="#5C6BC0" stroke-width="1.2" d="M42,40 L42,68"/>
+  <path stroke="#5C6BC0" stroke-width="1.2" d="M48,40 L48,68"/>
+  <path stroke="#5C6BC0" stroke-width="1.2" d="M54,40 L54,68"/>
+  <path stroke="#5C6BC0" stroke-width="1.2" d="M60,40 L60,68"/>
+  <path stroke="#5C6BC0" stroke-width="1.2" d="M66,40 L66,68"/>
+
+  <!-- Gate posts -->
+  <path stroke="#5C6BC0" stroke-width="1.8" d="M33,31 L33,77"/>
+  <path stroke="#5C6BC0" stroke-width="1.8" d="M75,31 L75,77"/>
+
+  <!-- Post caps -->
+  <rect fill="#5C6BC0" x="31" y="28" width="4" height="3"/>
+  <rect fill="#5C6BC0" x="73" y="28" width="4" height="3"/>
+</svg>

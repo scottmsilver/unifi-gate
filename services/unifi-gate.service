@@ -1,0 +1,12 @@
+[Unit]
+Description=UniFi Gate Server
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/unifi-gate
+ExecStart=/opt/unifi-gate/.venv/bin/python server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

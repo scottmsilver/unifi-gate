@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">UniFi Gate</string>
+    <string name="settings">Settings</string>
+    <string name="server_url">Server URL</string>
+    <string name="save">Save</string>
+    <string name="cancel">Cancel</string>
+    <string name="unlock">Unlock</string>
+    <string name="close">Close</string>
+    <string name="hold_open">Hold Open</string>
+    <string name="loading">Loading…</string>
+    <string name="error_connection">Connection error</string>
+    <string name="no_gates_configured">No gates configured</string>
+    <string name="default_web_client_id">YOUR_WEB_CLIENT_ID.apps.googleusercontent.com</string>
+</resources>

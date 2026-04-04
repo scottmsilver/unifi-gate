@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Shaker Gate - Pencil Sketch Style (blue on transparent) -->
+
+    <!-- Gate frame - outer rectangle -->
+    <path
+        android:strokeColor="#5C6BC0"
+        android:strokeWidth="1.5"
+        android:fillColor="#00000000"
+        android:pathData="M36,34 L72,34 L72,74 L36,74 Z"/>
+
+    <!-- Top rail -->
+    <path
+        android:strokeColor="#5C6BC0"
+        android:strokeWidth="1.2"
+        android:pathData="M36,40 L72,40"/>
+
+    <!-- Bottom rail -->
+    <path
+        android:strokeColor="#5C6BC0"
+        android:strokeWidth="1.2"
+        android:pathData="M36,68 L72,68"/>
+
+    <!-- Vertical slats (5 evenly spaced) -->
+    <path
+        android:strokeColor="#5C6BC0"
+        android:strokeWidth="1.2"
+        android:pathData="M42,40 L42,68"/>
+    <path
+        android:strokeColor="#5C6BC0"
+        android:strokeWidth="1.2"
+        android:pathData="M48,40 L48,68"/>
+    <path
+        android:strokeColor="#5C6BC0"
+        android:strokeWidth="1.2"
+        android:pathData="M54,40 L54,68"/>
+    <path
+        android:strokeColor="#5C6BC0"
+        android:strokeWidth="1.2"
+        android:pathData="M60,40 L60,68"/>
+    <path
+        android:strokeColor="#5C6BC0"
+        android:strokeWidth="1.2"
+        android:pathData="M66,40 L66,68"/>
+
+    <!-- Gate posts on sides -->
+    <path
+        android:strokeColor="#5C6BC0"
+        android:strokeWidth="1.8"
+        android:pathData="M33,31 L33,77"/>
+    <path
+        android:strokeColor="#5C6BC0"
+        android:strokeWidth="1.8"
+        android:pathData="M75,31 L75,77"/>
+
+    <!-- Post caps (small) -->
+    <path
+        android:fillColor="#5C6BC0"
+        android:pathData="M31,28 L35,28 L35,31 L31,31 Z"/>
+    <path
+        android:fillColor="#5C6BC0"
+        android:pathData="M73,28 L77,28 L77,31 L73,31 Z"/>
+</vector>

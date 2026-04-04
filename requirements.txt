@@ -1,0 +1,7 @@
+flask==3.0.3
+requests==2.32.4
+textual==6.2.1
+pytz==2025.2
+pytest==8.3.5
+websocket-client==1.7.0
+python-dotenv

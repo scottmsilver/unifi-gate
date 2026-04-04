@@ -1,0 +1,13 @@
+[Unit]
+Description=Cloudflare Tunnel for gate.yourdomain.com
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=youruser
+ExecStart=/usr/local/bin/cloudflared tunnel --config /home/youruser/.cloudflared/config-gate.yml run unifi-gate
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
