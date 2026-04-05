@@ -81,6 +81,7 @@ export default {
 
     const publicPaths = isPool ? [
       "/",           // Pool login page (auth handled client-side)
+      "/matter",     // Matter pairing page (QR code + manual code)
       "/favicon.ico",
       "/robots.txt",
     ] : [
