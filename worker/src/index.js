@@ -74,13 +74,15 @@ export default {
     // Gate UI: /, /admin, /static/, /invite/, /door-image/ are public.
     const isPool = url.hostname.startsWith('pool.');
 
-    // Handle LAN-based approval callback (self-contained, no auth header needed)
+    // Handle approval callback (self-contained, no auth header needed)
     if (isPool && url.pathname === '/api/approve-callback') {
       return handleApproveCallback(url, env, request);
     }
 
     const publicPaths = isPool ? [
       "/",           // Pool login page (auth handled client-side)
+      "/approve",    // Approval page (GET) and approve action (POST /api/approve)
+      "/api/approve", // Approve POST — daemon checks CF-Connecting-IP for proof of presence
       "/matter",     // Matter pairing page (QR code + manual code)
       "/favicon.ico",
       "/robots.txt",
@@ -213,11 +215,14 @@ async function forwardToOrigin(request, env, verifiedEmail) {
     targetUrl = request.url;
   }
 
-  // Forward the request to the origin
+  // Forward the request to the origin.
+  // redirect: "manual" ensures redirects are returned to the browser as-is
+  // (needed for the approve flow's 303 → callback chain).
   const response = await fetch(targetUrl, {
     method: request.method,
     headers,
     body: request.body,
+    redirect: "manual",
   });
 
   // Clone response and add CORS headers
@@ -281,9 +286,8 @@ function getCorsHeaders(request) {
 }
 
 /**
- * Handle LAN-based approval callback.
- * The daemon on the local network signs an HMAC proof that the user
- * was physically on the home WiFi. We validate it and add them to KV.
+ * Handle approval callback.
+ * Validates the HMAC proof and adds the user to the approved list in KV.
  */
 async function handleApproveCallback(url, env, request) {
   const email = url.searchParams.get("email");
