@@ -23,6 +23,7 @@ from invite_manager import InviteManager
 from kv_sync import CloudflareKV, sync_approved_users_to_kv
 from schedule_manager import EMPTY_HOLD_STATE, ScheduleManager
 from unifi_access import AccessEventStream, UniFiAccess, UnifiAccessError, fetch_console_name
+from unifi_cookie import CookieAuthError, UniFiCookieClient
 from unifi_protect import UniFiProtect, cameras_by_mac
 from user_store import UserRole, UserStatus, UserStore
 
@@ -48,6 +49,7 @@ FIREBASE_CONFIG = {
 # Global API instance
 access: UniFiAccess | None = None
 protect: UniFiProtect | None = None
+cover_session = None  # UniFiCookieClient (optional — for static door covers)
 schedule_manager = None
 event_log = None
 event_stream: AccessEventStream | None = None
@@ -386,7 +388,7 @@ def init_api():
     """Construct the Access (and optional Protect) clients from credentials.json,
     populate caches, attach the WebSocket event stream. Returns True if the
     server should boot (even in unconfigured 'setup mode')."""
-    global access, protect, schedule_manager, event_log, event_stream
+    global access, protect, cover_session, schedule_manager, event_log, event_stream
 
     creds = read_credentials()
     host = (creds.get("host") or "").strip()
@@ -421,6 +423,18 @@ def init_api():
     populate_camera_index()
     refresh_thumbnail_cache()
 
+    # Optional UniFi OS cookie session (for static cover images that the
+    # Developer API token can't reach). Loads persisted state if present.
+    cover_session = UniFiCookieClient(
+        host=host,
+        verify_ssl=False,
+        state_file=get_config_path("cover_session.json"),
+    )
+    if cover_session.restore_session():
+        logger.info("Cover session restored from disk.")
+    else:
+        logger.info("No cover session — admin must sign in via Settings → Covers for static covers.")
+
     schedule_manager = init_schedule_manager()
     event_log = init_event_log()
 
@@ -432,8 +446,26 @@ def init_api():
     except Exception as e:
         logger.warning(f"WebSocket event stream failed to start: {e}")
 
+    # Keep the UniFi OS cookie alive: hit /api/users/self every 12h so the
+    # sliding TTL never lapses. /door-image fetches refresh it too, but the
+    # heartbeat covers long quiet stretches.
+    threading.Thread(target=_cover_session_heartbeat_loop, daemon=True).start()
+
     logger.info("API initialized successfully")
     return True
+
+
+_COVER_HEARTBEAT_INTERVAL = 12 * 3600  # 12 hours
+
+
+def _cover_session_heartbeat_loop() -> None:
+    while True:
+        time.sleep(_COVER_HEARTBEAT_INTERVAL)
+        if cover_session and cover_session.is_connected():
+            try:
+                cover_session.heartbeat()
+            except Exception as e:
+                logger.warning("cover_session heartbeat error: %s", e)
 
 
 def get_custom_site_name() -> str | None:
@@ -522,7 +554,7 @@ _setup_lock = threading.Lock()
 def setup():
     """Configure or re-configure the controller connection with a Developer
     API bearer token. No username/password, no 2FA."""
-    global access, protect, schedule_manager, event_log, event_stream
+    global access, protect, cover_session, schedule_manager, event_log, event_stream
 
     data = request.get_json(silent=True) or {}
     host = (data.get("host") or "").strip().replace("https://", "").replace("http://", "").rstrip("/")
@@ -565,6 +597,19 @@ def setup():
         # Promote to globals and rebuild dependent state.
         access = candidate
         _console_name_cache["value"] = None  # host may have changed; force re-fetch
+
+        # Discard any cover session bound to the previous host — its cookies
+        # won't validate against the new controller.
+        if cover_session is not None and cover_session.host != host:
+            try:
+                cover_session._clear()
+            except Exception:
+                pass
+            cover_session = UniFiCookieClient(
+                host=host,
+                verify_ssl=False,
+                state_file=get_config_path("cover_session.json"),
+            )
         if protect_api_key:
             try:
                 protect = UniFiProtect(host=host, api_key=protect_api_key)
@@ -686,11 +731,13 @@ def list_devices():
         else:
             status = "unlocked"
 
-        # imageUrl is set only when a real image is available (Protect camera
-        # or Access /preview thumbnail). Cameraless doors get null so the
-        # frontend renders its round-circle lock-icon fallback instead of
-        # squeezing the placeholder SVG into the wide-rect slot.
-        has_real_image = d.id in _door_to_camera or d.id in _door_thumbnails
+        # imageUrl is set only when a real image is available — Protect camera,
+        # Access /preview thumbnail, OR an admin-uploaded cover via the cookie
+        # session. Cameraless doors with no cover get null so the frontend
+        # renders its round-circle lock-icon fallback instead of squeezing the
+        # placeholder SVG into the wide-rect slot.
+        has_cover = bool(cover_session and cover_session.has_cover(d.id))
+        has_real_image = has_cover or d.id in _door_to_camera or d.id in _door_thumbnails
 
         hold = schedule_manager.get_hold_state_data(d.id) if schedule_manager else dict(EMPTY_HOLD_STATE)
         doors_json.append(
@@ -707,22 +754,58 @@ def list_devices():
     return jsonify(doors_json)
 
 
+# Cover-session integration. In-process UniFi OS cookie client that fetches
+# the static door cover image (the Developer API token can't reach it).
+# Stays None until an admin logs in via Settings → Covers.
+
+
+def _fetch_cover(door_id: str) -> bytes | None:
+    """Try the cover session; return JPEG bytes on success, None otherwise.
+    Silent on errors so /door-image falls through cleanly."""
+    if not cover_session or not cover_session.is_connected():
+        return None
+    try:
+        return cover_session.get_cover(door_id)
+    except Exception as e:
+        logger.warning("cover fetch for %s failed: %s", door_id, e)
+        return None
+
+
+def _cover_status() -> dict:
+    """Status dict for the Settings UI."""
+    if not cover_session:
+        return {
+            "connected": False,
+            "cookieAgeSeconds": 0,
+            "lastHeartbeatAt": None,
+            "lastHeartbeatOk": None,
+            "csrfRotations": 0,
+        }
+    return cover_session.status()
+
+
 @app.route("/door-image/<door_id>", methods=["GET"])
 def get_door_image(door_id):
     """Serve a door image. Priority:
-      1. Access /preview thumbnail — last access event capture. Most events
-         happen in daylight (people coming and going) so this is usually a
-         bright, cover-like image. Functions as our 'cover' replacement.
-      2. Protect live snapshot — current frame. Used only as a fallback
-         because at night it's just a dark picture of nothing.
-      3. Placeholder SVG — when no camera is bound at all.
+      1. Cookie-authed cover image from UniFi OS — the real static cover,
+         best quality. Requires the admin to have signed in via Settings → Covers.
+      2. Access /preview thumbnail — last access event capture. Most events
+         happen in daylight so this is usually a bright cover-equivalent.
+      3. Protect live snapshot — current frame; can be dark at night.
+      4. Placeholder SVG — when no camera is bound at all.
 
-    Pass `?fresh=1` to force the live Protect snapshot (skipping the cover).
+    Pass `?fresh=1` to force the live Protect snapshot (skipping #1 and #2).
     """
-    if access:
-        prefer_fresh = request.args.get("fresh") in ("1", "true", "yes")
+    prefer_fresh = request.args.get("fresh") in ("1", "true", "yes")
 
-        # 1) Access /preview thumbnail — our cover-equivalent
+    if access:
+        # 1) Cover session — true static cover via cookie auth (if logged in)
+        if not prefer_fresh:
+            img = _fetch_cover(door_id)
+            if img:
+                return Response(img, mimetype="image/jpeg")
+
+        # 2) Access /preview thumbnail — our cover-equivalent
         if not prefer_fresh:
             path = _door_thumbnails.get(door_id)
             if not path:
@@ -735,7 +818,7 @@ def get_door_image(door_id):
                 except UnifiAccessError as e:
                     logger.warning(f"Access thumbnail for {door_id} failed: {e}")
 
-        # 2) Protect live snapshot — current frame, can be dark at night
+        # 3) Protect live snapshot — current frame, can be dark at night
         cam = _door_to_camera.get(door_id)
         if protect and cam:
             try:
@@ -744,8 +827,67 @@ def get_door_image(door_id):
             except UnifiAccessError as e:
                 logger.warning(f"Protect snapshot for {door_id} failed: {e}")
 
-    # 3) Placeholder for cameraless doors
+    # 4) Placeholder for cameraless doors
     return app.send_static_file("door-placeholder.svg")
+
+
+# =========== Cover Session (Admin) ===========
+
+
+@app.route("/admin/cover-session/status", methods=["GET"])
+@require_admin
+def cover_session_status():
+    """Status of the cookie session used for static cover images."""
+    return jsonify(_cover_status())
+
+
+@app.route("/admin/cover-session/heartbeat", methods=["POST"])
+@require_admin
+def cover_session_heartbeat():
+    """Manually fire a heartbeat — proves the cookie is still accepted by the
+    controller and returns whether CSRF rotated. Useful for validating that
+    the 12h background heartbeat is functioning."""
+    if not cover_session:
+        return jsonify({"error": "not_initialized"}), 503
+    result = cover_session.heartbeat()
+    log_admin("cover_session_heartbeat", str(result.get("ok")))
+    return jsonify({**result, "status_after": _cover_status()})
+
+
+@app.route("/admin/cover-session/login", methods=["POST"])
+@require_admin
+def cover_session_login():
+    """Establish the UniFi OS cookie session for cover-image fetching."""
+    global cover_session
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    otp = (data.get("otp") or "").strip()
+    if not username or not password:
+        return jsonify({"error": "username_and_password_required"}), 400
+
+    creds = read_credentials()
+    host = (creds.get("host") or "").strip()
+    if not host:
+        return jsonify({"error": "controller host not configured"}), 400
+
+    if cover_session is None:
+        cover_session = UniFiCookieClient(
+            host=host,
+            verify_ssl=False,
+            state_file=get_config_path("cover_session.json"),
+        )
+
+    try:
+        cover_session.login(username, password, otp=otp or None)
+    except CookieAuthError as e:
+        return jsonify({"error": str(e)}), 401
+    except Exception as e:
+        logger.exception("cover_session login failed")
+        return jsonify({"error": f"login_failed: {e}"}), 500
+
+    log_admin("cover_session_login", username)
+    return jsonify({"ok": True})
 
 
 @app.route("/status/<device_id>", methods=["GET"])

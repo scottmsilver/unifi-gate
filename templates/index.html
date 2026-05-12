@@ -1218,6 +1218,181 @@
             );
         }
 
+        function CoverSessionPanel() {
+            const [status, setStatus] = useState(null);
+            const [loading, setLoading] = useState(true);
+            const [form, setForm] = useState({ username: '', password: '', otp: '' });
+            const [submitMsg, setSubmitMsg] = useState('');
+
+            const refresh = async () => {
+                setLoading(true);
+                try {
+                    const res = await authFetch('/admin/cover-session/status');
+                    setStatus(await res.json());
+                } catch (e) {
+                    setStatus({ connected: false });
+                } finally {
+                    setLoading(false);
+                }
+            };
+
+            useEffect(() => { refresh(); }, []);
+
+            const handleSubmit = async (e) => {
+                e.preventDefault();
+                if (!form.username || !form.password) {
+                    setSubmitMsg('Username and password required');
+                    return;
+                }
+                setSubmitMsg('Signing in...');
+                try {
+                    const res = await authFetch('/admin/cover-session/login', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(form),
+                    });
+                    const data = await res.json().catch(() => ({}));
+                    if (res.ok && data.ok) {
+                        setSubmitMsg('Signed in.');
+                        setForm({ username: '', password: '', otp: '' });
+                        await refresh();
+                        setSubmitMsg('');
+                    } else {
+                        setSubmitMsg('Error: ' + (data.error || `HTTP ${res.status}`));
+                    }
+                } catch (err) {
+                    setSubmitMsg('Network error: ' + err.message);
+                }
+            };
+
+            const handleHeartbeat = async () => {
+                setSubmitMsg('Refreshing...');
+                try {
+                    const res = await authFetch('/admin/cover-session/heartbeat', { method: 'POST' });
+                    const data = await res.json().catch(() => ({}));
+                    if (data.ok) {
+                        const rotated = data.csrf_rotated ? ', CSRF rotated' : '';
+                        setSubmitMsg(`Cookie still valid (HTTP ${data.status}${rotated})`);
+                    } else {
+                        setSubmitMsg('Heartbeat failed: ' + (data.error || `HTTP ${res.status}`));
+                    }
+                    if (data.status_after) setStatus(data.status_after);
+                } catch (err) {
+                    setSubmitMsg('Network error: ' + err.message);
+                }
+            };
+
+            const fmtAge = (s) => {
+                if (!s) return '—';
+                if (s < 60) return `${s}s`;
+                if (s < 3600) return `${Math.floor(s/60)}m`;
+                return `${Math.floor(s/3600)}h`;
+            };
+
+            const fmtTimestamp = (epoch) => {
+                if (!epoch) return 'never';
+                const ago = Math.floor(Date.now() / 1000 - epoch);
+                return fmtAge(ago) + ' ago';
+            };
+
+            return (
+                <div className={`${STYLES.card} p-5 space-y-4`}>
+                    <div>
+                        <h3 className="text-base font-semibold text-gray-900">Door Covers</h3>
+                        <p className="text-xs text-gray-500 mt-1">
+                            Static cover images need UniFi OS cookie auth (the Developer API token can't reach them).
+                            Sign in once with your UniFi credentials; the cookie slides forward forever as long as the server runs.
+                        </p>
+                    </div>
+
+                    {/* Status row */}
+                    <div className="bg-gray-50 rounded-lg p-3 space-y-1 text-sm">
+                        {loading ? <LoadingSpinner size="sm" /> : (
+                            <React.Fragment>
+                                <div className="flex justify-between">
+                                    <span className="text-gray-500">Signed in</span>
+                                    <span className={status && status.connected ? 'text-green-600 font-medium' : 'text-red-600 font-medium'}>
+                                        {status && status.connected ? 'Yes' : 'No'}
+                                    </span>
+                                </div>
+                                {status && status.connected && (
+                                    <React.Fragment>
+                                        <div className="flex justify-between">
+                                            <span className="text-gray-500">Cookie age</span>
+                                            <span className="text-gray-900 font-mono text-xs">{fmtAge(status.cookieAgeSeconds)}</span>
+                                        </div>
+                                        <div className="flex justify-between">
+                                            <span className="text-gray-500">Last refresh</span>
+                                            <span className="text-gray-900 font-mono text-xs">
+                                                {fmtTimestamp(status.lastHeartbeatAt)}
+                                                {status.lastHeartbeatOk === false && ' (failed)'}
+                                                {status.lastHeartbeatOk === true && ' ✓'}
+                                            </span>
+                                        </div>
+                                        <div className="flex justify-between">
+                                            <span className="text-gray-500">CSRF rotations</span>
+                                            <span className="text-gray-900 font-mono text-xs">{status.csrfRotations || 0}</span>
+                                        </div>
+                                    </React.Fragment>
+                                )}
+                            </React.Fragment>
+                        )}
+                    </div>
+
+                    {status && status.connected && (
+                        <button onClick={handleHeartbeat} className={`w-full ${STYLES.btnSecondary}`}>
+                            Refresh now
+                        </button>
+                    )}
+
+                    {/* Login form */}
+                    {!loading && (
+                        <form onSubmit={handleSubmit} className="space-y-3">
+                            <div>
+                                <label className={STYLES.label}>UniFi Username</label>
+                                <input
+                                    type="text"
+                                    className={STYLES.input}
+                                    value={form.username}
+                                    onChange={e => setForm({...form, username: e.target.value})}
+                                    autoComplete="username"
+                                />
+                            </div>
+                            <div>
+                                <label className={STYLES.label}>Password</label>
+                                <input
+                                    type="password"
+                                    className={STYLES.input}
+                                    value={form.password}
+                                    onChange={e => setForm({...form, password: e.target.value})}
+                                    autoComplete="current-password"
+                                />
+                            </div>
+                            <div>
+                                <label className={STYLES.label}>2FA Code (if enabled)</label>
+                                <input
+                                    type="text"
+                                    inputMode="numeric"
+                                    placeholder="123456"
+                                    className={STYLES.input}
+                                    value={form.otp}
+                                    onChange={e => setForm({...form, otp: e.target.value})}
+                                />
+                            </div>
+                            <button type="submit" className={`w-full ${STYLES.btnPrimary}`}>
+                                {status && status.connected ? 'Re-authenticate' : 'Sign In'}
+                            </button>
+                            {submitMsg && (
+                                <p className={`text-center text-xs ${submitMsg.startsWith('Error') || submitMsg.startsWith('Network') ? 'text-red-500' : 'text-gray-500'}`}>
+                                    {submitMsg}
+                                </p>
+                            )}
+                        </form>
+                    )}
+                </div>
+            );
+        }
+
         function ActivityLog() {
             const [events, setEvents] = useState([]);
             const [loading, setLoading] = useState(true);
@@ -1670,7 +1845,7 @@
             const { signOut } = useAuth();
             const [activeSection, setActiveSection] = useState('connection');
             const [isEditing, setIsEditing] = useState(!(initialConfig && initialConfig.connected));
-            const [form, setForm] = useState({ host: '', username: 'admin', password: '', token: '', site_name: '' });
+            const [form, setForm] = useState({ host: '', token: '', protect_api_key: '', site_name: '' });
             const [status, setStatus] = useState('');
             const [editingName, setEditingName] = useState(false);
             const [nameDraft, setNameDraft] = useState('');
@@ -1700,7 +1875,6 @@
                     setForm(f => ({
                         ...f,
                         host: initialConfig.host || f.host,
-                        username: initialConfig.username || f.username,
                         site_name: initialConfig.site_name || f.site_name
                     }));
                     setIsEditing(!(initialConfig && initialConfig.connected));
@@ -1709,15 +1883,7 @@
 
             const handleSubmit = async (e) => {
                 e.preventDefault();
-                const isReconnect = !!form.password;
-                const hostChanged = initialConfig && form.host !== initialConfig.host;
-                const userChanged = initialConfig && form.username !== initialConfig.username;
-
-                if (!isReconnect && (hostChanged || userChanged)) {
-                    setStatus('Error: Password required to change Host or Username');
-                    return;
-                }
-
+                const isReconnect = !!form.token;  // entering an API token = re-point at controller
                 setStatus(isReconnect ? 'Connecting...' : 'Saving...');
 
                 try {
@@ -1743,6 +1909,7 @@
             const sections = [
                 { id: 'connection', label: 'Connection' },
                 ...(isAdmin ? [{ id: 'users', label: 'Users' }] : []),
+                ...(isAdmin ? [{ id: 'covers', label: 'Covers' }] : []),
                 { id: 'debug', label: 'Debug' },
                 { id: 'activity', label: 'Activity' },
             ];
@@ -1824,13 +1991,9 @@
                                             )}
                                             {nameStatus && <p className={`text-xs mt-1 text-right ${nameStatus.startsWith('Error') ? 'text-red-500' : 'text-gray-500'}`}>{nameStatus}</p>}
                                         </div>
-                                        <div className="flex justify-between py-2 border-b border-gray-100">
+                                        <div className="flex justify-between py-2">
                                             <span className="text-gray-500">Controller</span>
                                             <span className="text-gray-900 font-mono text-xs">{initialConfig.host}</span>
-                                        </div>
-                                        <div className="flex justify-between py-2">
-                                            <span className="text-gray-500">Username</span>
-                                            <span className="text-gray-900 font-medium">{initialConfig.username}</span>
                                         </div>
                                     </div>
                                     <button
@@ -1860,19 +2023,16 @@
                                         <input required type="text" placeholder="192.168.1.1" className={STYLES.input} value={form.host} onChange={e => setForm({...form, host: e.target.value})} />
                                     </div>
                                     <div>
-                                        <label className={STYLES.label}>Username</label>
-                                        <input required type="text" placeholder="admin" className={STYLES.input} value={form.username} onChange={e => setForm({...form, username: e.target.value})} />
+                                        <label className={STYLES.label}>Developer API Token</label>
+                                        <input type="password" placeholder={initialConfig && initialConfig.connected ? "(leave blank to keep current)" : "From UniFi UI → System → Advanced → API"} className={STYLES.input} value={form.token} onChange={e => setForm({...form, token: e.target.value})} />
+                                        <p className="text-xs text-gray-500 mt-1">Enter only if changing controller or rotating the token. Not your password.</p>
                                     </div>
                                     <div>
-                                        <label className={STYLES.label}>Password</label>
-                                        <input type="password" placeholder={initialConfig && initialConfig.connected ? "(Unchanged)" : "Password"} className={STYLES.input} value={form.password} onChange={e => setForm({...form, password: e.target.value})} />
-                                    </div>
-                                    <div>
-                                        <label className={STYLES.label}>2FA Code (Optional)</label>
-                                        <input type="text" placeholder="123456" className={STYLES.input} value={form.token} onChange={e => setForm({...form, token: e.target.value})} />
+                                        <label className={STYLES.label}>Protect API Key (optional)</label>
+                                        <input type="password" placeholder="(leave blank to keep current)" className={STYLES.input} value={form.protect_api_key} onChange={e => setForm({...form, protect_api_key: e.target.value})} />
                                     </div>
                                     <button type="submit" className={`w-full ${STYLES.btnPrimary}`}>
-                                        {form.password ? "Connect" : "Save"}
+                                        {form.token ? "Connect" : "Save"}
                                     </button>
                                     {status && <p className={`text-center text-xs mt-2 ${status.includes('Success') ? 'text-green-500' : 'text-red-500'}`}>{status}</p>}
                                 </form>
@@ -1882,6 +2042,9 @@
 
                     {/* Users Section (Admin only) */}
                     {activeSection === 'users' && isAdmin && <UserManagement />}
+
+                    {/* Cover Sidecar Section (Admin only) */}
+                    {activeSection === 'covers' && isAdmin && <CoverSessionPanel />}
 
                     {/* Debug Section */}
                     {activeSection === 'debug' && <DoorsDebugList />}

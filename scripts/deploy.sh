@@ -14,6 +14,7 @@ APP_FILES=(
     server.py
     unifi_access.py
     unifi_protect.py
+    unifi_cookie.py
     schedule_manager.py
     user_store.py
     invite_manager.py
@@ -51,6 +52,7 @@ STATIC_FILES=(
 STATE_FILES=(
     credentials.json
     users.json
+    cover_session.json
     .env
 )
 
@@ -77,6 +79,16 @@ fi
 
 echo "==> Removing legacy files (cookie API + session caches)..."
 cleanup_legacy
+
+# Scrub the abandoned Node cover-sidecar if a previous deploy installed it.
+echo "==> Scrubbing legacy cover-sidecar (Node) if present..."
+incus exec "$CONTAINER" -- bash -c '
+    systemctl stop unifi-cover-sidecar 2>/dev/null || true
+    systemctl disable unifi-cover-sidecar 2>/dev/null || true
+    rm -f /etc/systemd/system/unifi-cover-sidecar.service
+    rm -rf /opt/unifi-cover-sidecar
+    systemctl daemon-reload
+' 2>/dev/null || true
 
 # Push application code
 echo "==> Pushing application code..."
