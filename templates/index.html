@@ -19,7 +19,7 @@
         .btn-press:active { transform: scale(0.96); transition: transform 0.1s; }
     </style>
 </head>
-<body class="min-h-screen flex justify-center pt-10 px-4">
+<body class="min-h-screen flex justify-center pt-4 px-4">
 
     <div id="root" class="w-full max-w-lg"></div>
 
@@ -415,19 +415,18 @@
                 <div className="relative" ref={dropdownRef}>
                     <button
                         onClick={() => setIsOpen(!isOpen)}
-                        className="flex items-center gap-2 px-2 py-1 rounded-full hover:bg-gray-100 transition-colors"
+                        className="flex items-center p-1 rounded-full hover:bg-gray-100 transition-colors"
                     >
-                        <span className="text-xs text-gray-500 font-medium">{displayName}</span>
                         {isGuest ? (
-                            <div className={`h-2 w-2 rounded-full ${dotColor}`}></div>
+                            <div className={`h-3 w-3 rounded-full ${dotColor}`}></div>
                         ) : hasPhoto ? (
                             <img
                                 src={user.photoURL}
                                 alt="Profile"
-                                className={`h-6 w-6 rounded-full border-2 ${borderColor} object-cover`}
+                                className={`h-10 w-10 rounded-full border-2 ${borderColor} object-cover`}
                             />
                         ) : (
-                            <div className={`h-6 w-6 rounded-full flex items-center justify-center text-xs font-bold ${bgColor}`}>
+                            <div className={`h-10 w-10 rounded-full flex items-center justify-center text-base font-bold ${bgColor}`}>
                                 {avatarLetter}
                             </div>
                         )}
@@ -546,7 +545,7 @@
         function App() {
             const { user, loading: authLoading, isAuthenticated, devMode, signOut } = useAuth();
             const [doors, setDoors] = useState([]);
-            const [config, setConfig] = useState({ configured: false, connected: false, site_name: 'Access', site_timezone: null });
+            const [config, setConfig] = useState({ configured: false, connected: false, site_name: 'Access' });
             const [loading, setLoading] = useState(true);
             const [view, setView] = useState('loading');
             const adminMode = window.SERVER_CONFIG.adminMode;
@@ -573,17 +572,7 @@
                 try {
                     const res = await authFetch('/devices');
                     if (!res.ok) throw new Error("Failed");
-                    const data = await res.json();
-                    const extendedDoors = await Promise.all(data.map(async (door) => {
-                        try {
-                            const statusRes = await authFetch(`/status/${door.id}`);
-                            const statusData = await statusRes.json();
-                            return { ...door, ...statusData };
-                        } catch (e) {
-                            return door;
-                        }
-                    }));
-                    setDoors(extendedDoors);
+                    setDoors(await res.json());
                 } catch (err) {
                     console.error(err);
                 }
@@ -633,15 +622,14 @@
             if (loading) return <FullPageLoading />;
 
             return (
-                <div className="space-y-6">
+                <div className="space-y-4">
                     {/* Header */}
-                    <div className="flex justify-between items-center px-1 py-2">
+                    <div className="flex justify-between items-center px-1">
                         <button
                             onClick={() => { checkConfig(); setView('dashboard'); }}
                             className="text-left hover:opacity-70 transition-opacity"
                         >
-                            <h1 className="text-xl font-bold text-gray-900 tracking-tight">{config.site_name}</h1>
-                            <p className="text-xs text-gray-500 font-medium uppercase tracking-wide mt-0.5">{config.site_timezone || ''}</p>
+                            <h1 className="text-3xl font-bold text-gray-900 tracking-tight">{config.site_name}</h1>
                         </button>
 
                         <ProfileDropdown
@@ -653,7 +641,7 @@
                     </div>
 
                     {view === 'setup' ? (
-                        <SetupForm onClose={() => { checkConfig(); setView('dashboard'); }} initialConfig={config} isAdmin={(user && user.isAdmin)} />
+                        <SetupForm onClose={() => { checkConfig(); setView('dashboard'); }} onConfigChange={checkConfig} initialConfig={config} isAdmin={(user && user.isAdmin)} />
                     ) : (
                         <div className="space-y-3">
                             {doors.map(door => (
@@ -758,19 +746,26 @@
             const [pickerMinute, setPickerMinute] = React.useState('00');
             const [pickerPeriod, setPickerPeriod] = React.useState('PM');
 
-            // Open time picker modal
+            // Open time picker modal. Default to a sensible *future* slot:
+            //   - if there's a live hold and its expiry is still in the future, use that
+            //   - otherwise: now + 30 min, rounded UP to the nearest 15-min slot
+            // The backend treats HH:MM as the next occurrence (today, or tomorrow if
+            // already past), so picking 1:00 AM at 9 PM means 1 AM tomorrow.
             const openTimePicker = () => {
-                // Get current expiry time for initial selection
-                const expiry = door.expires_at ? new Date(door.expires_at * 1000) : new Date();
-                const currentHour = expiry.getHours();
-                const currentMin = expiry.getMinutes();
-                const isPM = currentHour >= 12;
-                const displayHour = currentHour % 12 || 12;
-                const nearestMin = Math.round(currentMin / 15) * 15 % 60;
+                const now = new Date();
+                const liveExpiry = door.expires_at && door.expires_at * 1000 > now.getTime()
+                    ? new Date(door.expires_at * 1000)
+                    : null;
 
-                setPickerHour(displayHour);
-                setPickerMinute(String(nearestMin).padStart(2, '0'));
-                setPickerPeriod(isPM ? 'PM' : 'AM');
+                let target = liveExpiry || new Date(now.getTime() + 30 * 60 * 1000);
+                const rem = target.getMinutes() % 15;
+                if (rem !== 0) target.setMinutes(target.getMinutes() + (15 - rem));
+                target.setSeconds(0, 0);
+
+                const hh = target.getHours();
+                setPickerHour(hh % 12 || 12);
+                setPickerMinute(String(target.getMinutes()).padStart(2, '0'));
+                setPickerPeriod(hh >= 12 ? 'PM' : 'AM');
                 setShowTimePicker(true);
             };
 
@@ -801,21 +796,23 @@
                     {/* Top Row: Info */}
                     <div className="flex justify-between items-center">
                         <div className="flex items-center gap-4">
-                            {/* Thumbnail / Icon */}
-                            {door.imageUrl && door.imageUrl.startsWith('/door-image/') ? (
-                                <div className="w-24 h-14 rounded-lg bg-gray-100 overflow-hidden flex-shrink-0 border border-gray-200 shadow-sm">
-                                    <img src={door.imageUrl} alt={door.name} className="w-full h-full object-cover" />
-                                </div>
-                            ) : (
-                                <div className={`h-12 w-12 rounded-full flex-shrink-0 flex items-center justify-center transition-colors duration-500 bg-${themeColor}-100 text-${themeColor}-600`}>
-                                    <div className="relative w-6 h-6">
-                                        {/* Lock Body */}
-                                        <LockIcon locked={true} className={`absolute inset-0 w-full h-full transition-opacity duration-300 ${isOpen ? 'opacity-0 scale-75' : 'opacity-100 scale-100'}`} />
-                                        {/* Unlocked Body */}
-                                        <LockIcon locked={false} className={`absolute inset-0 w-full h-full transition-opacity duration-300 ${isOpen ? 'opacity-100 scale-100' : 'opacity-0 scale-75'}`} />
+                            {/* Fixed-width image slot so name + status align across cards */}
+                            <div className="w-24 h-14 flex-shrink-0 flex items-center justify-center">
+                                {door.imageUrl && door.imageUrl.startsWith('/door-image/') ? (
+                                    <div className="w-24 h-14 rounded-lg bg-gray-100 overflow-hidden border border-gray-200 shadow-sm">
+                                        <img src={door.imageUrl} alt={door.name} className="w-full h-full object-cover" />
                                     </div>
-                                </div>
-                            )}
+                                ) : (
+                                    <div className={`h-12 w-12 rounded-full flex items-center justify-center transition-colors duration-500 bg-${themeColor}-100 text-${themeColor}-600`}>
+                                        <div className="relative w-6 h-6">
+                                            {/* Lock Body */}
+                                            <LockIcon locked={true} className={`absolute inset-0 w-full h-full transition-opacity duration-300 ${isOpen ? 'opacity-0 scale-75' : 'opacity-100 scale-100'}`} />
+                                            {/* Unlocked Body */}
+                                            <LockIcon locked={false} className={`absolute inset-0 w-full h-full transition-opacity duration-300 ${isOpen ? 'opacity-100 scale-100' : 'opacity-0 scale-75'}`} />
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
 
                             <div>
                                 <h3 className="font-bold text-gray-900 text-lg leading-tight">{door.name}</h3>
@@ -913,6 +910,14 @@
                                     <option value="PM">PM</option>
                                 </select>
                             </div>
+                            {holdState && (
+                                <button
+                                    onClick={() => { setShowTimePicker(false); handle('stop_hold'); }}
+                                    className="w-full py-2.5 rounded-xl border border-red-300 text-red-600 font-medium hover:bg-red-50 mb-3"
+                                >
+                                    Release Hold
+                                </button>
+                            )}
                             <div className="flex gap-3">
                                 <button
                                     onClick={() => setShowTimePicker(false)}
@@ -1008,14 +1013,6 @@
 
             const getHardwareStatus = () => {
                 return (debugData && debugData.unifi && debugData.unifi.hardware_status) || null;
-            };
-
-            const getLocalState = () => {
-                return (debugData && debugData.local && debugData.local.hold_state) || null;
-            };
-
-            const getJournalEntries = () => {
-                return (debugData && debugData.local && debugData.local.journal_entries) || [];
             };
 
             const getWebsocketInfo = () => {
@@ -1150,53 +1147,6 @@
                                                         );
                                                     })}
                                                 </div>
-                                            </div>
-                                        </div>
-                                    )}
-
-                                    {/* Local State */}
-                                    <div className={`rounded-lg p-3 ${getLocalState() ? 'bg-green-50' : 'bg-gray-50'}`}>
-                                        <h4 className={`${STYLES.sectionHeader} ${getLocalState() ? 'text-green-700' : 'text-gray-700'}`}>
-                                            Local Hold State
-                                        </h4>
-                                        {getLocalState() ? (
-                                            <div className="space-y-0">
-                                                <InfoRow label="State" value={getLocalState().state} />
-                                                <InfoRow label="Created" value={formatTimestamp(getLocalState().created_at)} />
-                                                <InfoRow label="Expires" value={getLocalState().expires_at ? formatTimestamp(getLocalState().expires_at) : 'Never'} />
-                                                {getLocalState().schedule_block && (
-                                                    <InfoRow
-                                                        label="Block"
-                                                        value={`Day ${getLocalState().schedule_block.day}: ${(getLocalState().schedule_block.start_time || '').slice(0,5)}-${(getLocalState().schedule_block.end_time || '').slice(0,5)}`}
-                                                        mono
-                                                    />
-                                                )}
-                                            </div>
-                                        ) : (
-                                            <p className="text-gray-500 text-xs">No active hold</p>
-                                        )}
-                                    </div>
-
-                                    {/* Journal Entries */}
-                                    {getJournalEntries().length > 0 && (
-                                        <div className={STYLES.infoSection}>
-                                            <h4 className={`${STYLES.sectionHeader} text-gray-700`}>
-                                                Recent Journal ({getJournalEntries().length})
-                                            </h4>
-                                            <div className="space-y-1 max-h-32 overflow-y-auto">
-                                                {getJournalEntries().map((entry, idx) => (
-                                                    <div key={idx} className="flex items-center gap-2 text-xs py-1 border-b border-gray-100 last:border-0">
-                                                        <span className={`px-1.5 py-0.5 rounded font-medium ${entry.action === 'create' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
-                                                            {entry.action}
-                                                        </span>
-                                                        <span className="text-gray-600 font-mono">
-                                                            Day {entry.day} {(entry.start_time || '').slice(0,5)}-{(entry.end_time || '').slice(0,5)}
-                                                        </span>
-                                                        <span className="text-gray-400 ml-auto">
-                                                            {(entry.timestamp || '').slice(11,16)}
-                                                        </span>
-                                                    </div>
-                                                ))}
                                             </div>
                                         </div>
                                     )}
@@ -1716,12 +1666,34 @@
             );
         }
 
-        function SetupForm({ onClose, initialConfig, isAdmin }) {
+        function SetupForm({ onClose, onConfigChange, initialConfig, isAdmin }) {
             const { signOut } = useAuth();
             const [activeSection, setActiveSection] = useState('connection');
             const [isEditing, setIsEditing] = useState(!(initialConfig && initialConfig.connected));
             const [form, setForm] = useState({ host: '', username: 'admin', password: '', token: '', site_name: '' });
             const [status, setStatus] = useState('');
+            const [editingName, setEditingName] = useState(false);
+            const [nameDraft, setNameDraft] = useState('');
+            const [nameStatus, setNameStatus] = useState('');
+
+            const saveSiteName = async () => {
+                const trimmed = nameDraft.trim();
+                setNameStatus('Saving...');
+                try {
+                    const res = await authFetch('/config/update', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ site_name: trimmed }),
+                    });
+                    const data = await res.json();
+                    if (!res.ok) throw new Error(data.message || 'Failed');
+                    setNameStatus('');
+                    setEditingName(false);
+                    if (onConfigChange) onConfigChange();
+                } catch (err) {
+                    setNameStatus('Error: ' + err.message);
+                }
+            };
 
             useEffect(() => {
                 if(initialConfig) {
@@ -1818,9 +1790,39 @@
                                                 <span className="h-2 w-2 rounded-full bg-green-500"></span> Connected
                                             </span>
                                         </div>
-                                        <div className="flex justify-between py-2 border-b border-gray-100">
-                                            <span className="text-gray-500">Site Name</span>
-                                            <span className="text-gray-900 font-medium">{initialConfig.site_name || 'Default'}</span>
+                                        <div className="py-2 border-b border-gray-100">
+                                            {editingName ? (
+                                                <div className="flex items-center gap-2">
+                                                    <span className="text-gray-500 text-sm shrink-0">Site Name</span>
+                                                    <input
+                                                        autoFocus
+                                                        type="text"
+                                                        value={nameDraft}
+                                                        onChange={e => setNameDraft(e.target.value)}
+                                                        onKeyDown={e => { if (e.key === 'Enter') saveSiteName(); if (e.key === 'Escape') { setEditingName(false); setNameStatus(''); } }}
+                                                        placeholder="e.g. Home"
+                                                        className={`${STYLES.input} text-right`}
+                                                    />
+                                                    <button onClick={saveSiteName} className="text-xs text-green-600 hover:text-green-800 font-medium">Save</button>
+                                                    <button onClick={() => { setEditingName(false); setNameStatus(''); }} className="text-xs text-gray-400 hover:text-gray-600">Cancel</button>
+                                                </div>
+                                            ) : (
+                                                <div className="flex justify-between items-center">
+                                                    <span className="text-gray-500">Site Name</span>
+                                                    <div className="flex items-center gap-2">
+                                                        <span className="text-gray-900 font-medium">{initialConfig.site_name || 'Default'}</span>
+                                                        {isAdmin && (
+                                                            <button
+                                                                onClick={() => { setNameDraft(initialConfig.site_name || ''); setEditingName(true); }}
+                                                                className="text-xs text-blue-600 hover:text-blue-800"
+                                                            >
+                                                                Edit
+                                                            </button>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                            )}
+                                            {nameStatus && <p className={`text-xs mt-1 text-right ${nameStatus.startsWith('Error') ? 'text-red-500' : 'text-gray-500'}`}>{nameStatus}</p>}
                                         </div>
                                         <div className="flex justify-between py-2 border-b border-gray-100">
                                             <span className="text-gray-500">Controller</span>

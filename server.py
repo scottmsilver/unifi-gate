@@ -1,14 +1,19 @@
 import argparse
+import atexit
 import json
 import logging
 import os
+import re
+import socket
 import threading
 import time
 from collections import deque
 from datetime import datetime
+from functools import wraps
 
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, render_template, request
+from zeroconf import ServiceInfo, Zeroconf
 
 # Load .env file before accessing environment variables
 load_dotenv()
@@ -16,10 +21,9 @@ load_dotenv()
 from event_log import EventLog
 from invite_manager import InviteManager
 from kv_sync import CloudflareKV, sync_approved_users_to_kv
-from schedule_manager import ScheduleManager
-from unifi_access_api import UnifiAccessAPI
-from unifi_native_api import UniFiNativeAPI
-from unifi_websocket import UniFiAccessWebSocket
+from schedule_manager import EMPTY_HOLD_STATE, ScheduleManager
+from unifi_access import AccessEventStream, UniFiAccess, UnifiAccessError, fetch_console_name
+from unifi_protect import UniFiProtect, cameras_by_mac
 from user_store import UserRole, UserStatus, UserStore
 
 # Configure logging
@@ -42,17 +46,19 @@ FIREBASE_CONFIG = {
 }
 
 # Global API instance
-native_api = None
-dev_api = None
+access: UniFiAccess | None = None
+protect: UniFiProtect | None = None
 schedule_manager = None
 event_log = None
-access_websocket = None
+event_stream: AccessEventStream | None = None
 user_store = None
 invite_manager = None
 kv_client = None
-_native_devices_cache = []  # Cache for native devices data (for images/details)
-_door_thumbnails = {}  # Cache for door_id -> thumbnail_path
-_websocket_events = deque(maxlen=100)  # Recent WebSocket events buffer
+_devices_cache: list = []  # List[Device] from access.list_devices()
+_door_thumbnails: dict = {}  # door_id -> thumbnail_path (e.g. "/preview/...jpg")
+_door_to_camera: dict = {}  # door_id -> protect.Camera (for snapshot fallback)
+_websocket_events = deque(maxlen=100)
+_zeroconf = None
 
 
 # --- Helper functions to reduce duplication ---
@@ -63,25 +69,110 @@ def get_config_path(filename: str) -> str:
     return os.path.join(CONFIG_DIR, filename)
 
 
-def require_api(api_obj, api_name: str = "API"):
-    """Check if API is initialized, return error response if not."""
-    if not api_obj:
-        return jsonify({"error": f"{api_name} not initialized"}), 500
-    return None
+def read_credentials() -> dict:
+    """Load credentials.json. Returns empty dict if missing or unreadable."""
+    path = get_config_path("credentials.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning(f"credentials.json unreadable: {e}")
+        return {}
 
 
-def require_user_store():
-    """Check if user_store is initialized, return error response if not."""
-    if not user_store:
-        return jsonify({"error": "User store not initialized"}), 500
-    return None
+def write_credentials(creds: dict) -> None:
+    """Persist credentials.json. Raises on I/O error."""
+    with open(get_config_path("credentials.json"), "w") as f:
+        json.dump(creds, f, indent=4)
+
+
+def update_credentials(**fields) -> dict:
+    """Merge `fields` into credentials.json (read-modify-write). Empty/None
+    values in `fields` are ignored so callers don't accidentally clobber
+    existing keys when a field wasn't supplied. Returns the merged dict."""
+    creds = read_credentials()
+    for k, v in fields.items():
+        if v is None or v == "":
+            continue
+        creds[k] = v
+    write_credentials(creds)
+    return creds
+
+
+def requires_user_store(f):
+    """Decorator: 500 if user_store isn't initialized."""
+
+    @wraps(f)
+    def wrap(*args, **kwargs):
+        if not user_store:
+            return jsonify({"error": "User store not initialized"}), 500
+        return f(*args, **kwargs)
+
+    return wrap
 
 
 def require_schedule_manager():
-    """Check if schedule_manager is initialized, return error response if not."""
+    """Guard for non-route callers (e.g. _hold_endpoint). Returns Response|None."""
     if not schedule_manager:
         return jsonify({"error": "API not initialized"}), 500
     return None
+
+
+# ---- Auth helpers (must be defined before any route that uses them) ----
+
+
+def get_verified_user() -> tuple[str, bool]:
+    """Return (email, is_admin) for the current request.
+
+    Priority:
+    1. X-Verified-User header (set by the Cloudflare Worker after Firebase JWT validation)
+    2. Cf-Access-Authenticated-User-Email header (legacy Cloudflare Access)
+    3. "Guest" in dev mode, else (None, False)
+    """
+    verified_user = request.headers.get("X-Verified-User")
+    if verified_user:
+        is_admin = user_store.is_admin(verified_user) if user_store else False
+        return verified_user, is_admin
+
+    cf_user = request.headers.get("Cf-Access-Authenticated-User-Email")
+    if cf_user:
+        is_admin = user_store.is_admin(cf_user) if user_store else False
+        return cf_user, is_admin
+
+    if DEV_MODE:
+        return "Guest", True  # Guest is admin in dev mode for testing
+
+    return None, False
+
+
+def require_auth(f):
+    """Decorator: require authentication (passes through in dev mode)."""
+
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        user, _ = get_verified_user()
+        if user is None:
+            return jsonify({"error": "Authentication required"}), 401
+        return f(*args, **kwargs)
+
+    return decorated_function
+
+
+def require_admin(f):
+    """Decorator: require admin role (passes through in dev mode — Guest is admin)."""
+
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        user, is_admin = get_verified_user()
+        if user is None:
+            return jsonify({"error": "Authentication required"}), 401
+        if not is_admin:
+            return jsonify({"error": "Admin access required"}), 403
+        return f(*args, **kwargs)
+
+    return decorated_function
 
 
 def validate_email(email: str) -> tuple[bool, str]:
@@ -104,6 +195,46 @@ def check_user_exists(email: str) -> tuple[bool, any]:
     return existing is not None, existing
 
 
+def get_local_ip():
+    """Get the local IP address for mDNS advertisement."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+def start_mdns(port, site_name="UniFi Gate"):
+    """Register mDNS service for auto-discovery."""
+    global _zeroconf
+    try:
+        local_ip = get_local_ip()
+        info = ServiceInfo(
+            "_unifi-gate._tcp.local.",
+            "UniFi Gate._unifi-gate._tcp.local.",
+            addresses=[socket.inet_aton(local_ip)],
+            port=port,
+            properties={"site": site_name},
+        )
+        _zeroconf = Zeroconf()
+        _zeroconf.register_service(info)
+        logger.info(f"mDNS: advertising _unifi-gate._tcp on {local_ip}:{port}")
+    except Exception as e:
+        logger.warning(f"mDNS advertisement failed (non-fatal): {e}")
+
+
+def stop_mdns():
+    """Unregister mDNS service."""
+    global _zeroconf
+    if _zeroconf:
+        _zeroconf.unregister_all_services()
+        _zeroconf.close()
+        _zeroconf = None
+
+
 def sync_users_to_kv(context: str = ""):
     """Sync approved users to Cloudflare KV. Returns sync status dict or None."""
     if not kv_client or not kv_client.is_configured():
@@ -120,24 +251,48 @@ def sync_users_to_kv(context: str = ""):
     return {"synced": success, "message": message}
 
 
-def populate_native_devices_cache() -> None:
-    """Populate the native devices cache from the API."""
-    global _native_devices_cache
+def populate_devices_cache() -> None:
+    """Populate the access devices cache (hardware: hubs, intercoms, readers)."""
+    global _devices_cache
+    if not access:
+        return
     try:
-        native_devices_response = native_api._make_request("GET", "/proxy/access/api/v2/devices")
-        if native_devices_response and "data" in native_devices_response:
-            _native_devices_cache = native_devices_response["data"]
-            logger.info(f"Cached {len(_native_devices_cache)} native devices.")
-    except Exception as e:
-        logger.error(f"Failed to cache native devices: {e}")
-        _native_devices_cache = []
+        _devices_cache = access.list_devices()
+        logger.info(f"Cached {len(_devices_cache)} access devices.")
+    except UnifiAccessError as e:
+        logger.error(f"Failed to cache devices: {e}")
+        _devices_cache = []
+
+
+def populate_camera_index() -> None:
+    """Build the door_id -> Protect Camera map via MAC matching.
+    An Access intercom/hub has `id == its MAC`; a Protect camera carries `mac`.
+    No-op (silent) if Protect isn't configured."""
+    global _door_to_camera
+    _door_to_camera = {}
+    if not protect:
+        return
+    try:
+        cams_by_mac = cameras_by_mac(protect.list_cameras())
+    except UnifiAccessError as e:
+        logger.warning(f"Protect camera fetch failed: {e}")
+        return
+    for dev in _devices_cache:
+        cam = cams_by_mac.get(dev.id.lower())
+        if cam and dev.location_id:
+            _door_to_camera[dev.location_id] = cam
+    if _door_to_camera:
+        logger.info(f"Mapped {len(_door_to_camera)} door(s) to Protect cameras.")
+
+
+def get_site_timezone() -> str:
+    """Read site_timezone from credentials.json, falling back to UTC."""
+    return read_credentials().get("site_timezone") or "UTC"
 
 
 def init_schedule_manager() -> ScheduleManager:
     """Create and return a new ScheduleManager instance."""
-    state_file = get_config_path("hold_state.json")
-    journal_file = get_config_path("schedule_journal.log")
-    return ScheduleManager(native_api, state_file=state_file, journal_file=journal_file)
+    return ScheduleManager(access, timezone=get_site_timezone())
 
 
 def init_event_log() -> EventLog:
@@ -207,200 +362,121 @@ def handle_websocket_event(event: dict) -> None:
         event_log.log_ws_event("ws_exit", device_id, device_name, actor)
 
 
-def run_periodic_sync():
-    """Background thread to sync state periodically and clean orphan schedules."""
-    logger.info("Starting periodic sync thread (interval: 60s)")
-    while True:
-        try:
-            if schedule_manager:
-                # Regular state sync (handles expired holds, re-injection)
-                sync_results = schedule_manager.sync_state()
-
-                # Log sync if anything happened
-                if event_log:
-                    migrated = len(sync_results.get("migrated", []))
-                    expired = len(sync_results.get("expired", []))
-                    reinjected = len(sync_results.get("reinjected", []))
-                    if migrated > 0 or expired > 0 or reinjected > 0:
-                        details = []
-                        if expired > 0:
-                            details.append(f"{expired} expired")
-                        if reinjected > 0:
-                            details.append(f"{reinjected} reinjected")
-                        if migrated > 0:
-                            details.append(f"{migrated} migrated")
-                        event_log.log_sync(", ".join(details))
-
-                # Orphan cleanup: for devices with no local hold, remove any stale schedules
-                # Get all known door IDs from dev_api or native_api
-                device_ids = []
-                if dev_api:
-                    try:
-                        doors = dev_api.get_doors()
-                        device_ids = [d.id for d in doors]
-                    except Exception as e:
-                        logger.warning(f"Failed to get doors from dev_api: {e}")
-                elif native_api:
-                    try:
-                        doors = native_api.get_doors()
-                        device_ids = [d.id for d in doors]
-                    except Exception as e:
-                        logger.warning(f"Failed to get doors from native_api: {e}")
-
-                # Clean orphans for devices that have no local hold state
-                for device_id in device_ids:
-                    if not schedule_manager.state_manager.is_held(device_id):
-                        result = schedule_manager.force_sync_device(device_id)
-                        if result.get("removed", 0) > 0:
-                            logger.info(f"Orphan cleanup: removed {result['removed']} blocks from {device_id}")
-                            if event_log:
-                                event_log.log_orphan_cleanup(device_id, result["removed"])
-
-        except Exception as e:
-            logger.error(f"Periodic sync failed: {e}")
-        time.sleep(60)
-
-
 def refresh_thumbnail_cache():
+    """Build door_id -> thumbnail_path map from access.list_doors().
+    Prefers the live `door_thumbnail` (Access preview) — the static `door_cover`
+    is not fetchable via the Developer API (cookie-only on port 443)."""
     global _door_thumbnails
+    if not access:
+        return
     try:
-        # Force fetch to ensure we have latest
-        native_api._fetch_bootstrap()
-
-        if native_api._bootstrap and "data" in native_api._bootstrap:
-            data = native_api._bootstrap["data"]
-            if isinstance(data, list) and len(data) > 0:
-                main_site = data[0]
-
-                # Iterate through floors to find doors and their thumbnails
-                floors = main_site.get("floors", [])
-                for floor in floors:
-                    doors = floor.get("doors", [])
-                    for door in doors:
-                        door_id = door.get("unique_id")
-                        extras = door.get("extras", {})
-                        # Use static door_cover (more reliable than dynamic door_thumbnail)
-                        cover_path = extras.get("door_cover")
-
-                        if door_id and cover_path:
-                            _door_thumbnails[door_id] = cover_path
-
-                logger.info(f"Refreshed cache: {len(_door_thumbnails)} door thumbnails.")
-    except Exception as e:
-        logger.error(f"Failed to cache thumbnails: {e}")
+        doors = access.list_doors()
+    except UnifiAccessError as e:
+        logger.error(f"Failed to refresh thumbnails: {e}")
+        return
+    _door_thumbnails = {}
+    for d in doors:
+        # Only `thumbnail_path` (/preview/...) is reachable with the bearer token.
+        if d.thumbnail_path:
+            _door_thumbnails[d.id] = d.thumbnail_path
+    logger.info(f"Refreshed thumbnail cache: {len(_door_thumbnails)} door(s) with preview.")
 
 
 def init_api():
-    global native_api, dev_api, schedule_manager, _native_devices_cache, _door_thumbnails
+    """Construct the Access (and optional Protect) clients from credentials.json,
+    populate caches, attach the WebSocket event stream. Returns True if the
+    server should boot (even in unconfigured 'setup mode')."""
+    global access, protect, schedule_manager, event_log, event_stream
 
-    # Initialize Developer API for listing devices (it's more reliable for lists)
-    try:
-        dev_creds_file = os.path.join(CONFIG_DIR, "credentials.json")
-        if os.path.exists(dev_creds_file):
-            with open(dev_creds_file, "r") as f:
-                dev_creds = json.load(f)
-            dev_api = UnifiAccessAPI(host=dev_creds.get("host"), token=dev_creds.get("token"))
-            logger.info(f"Developer API initialized from {dev_creds_file}")
-    except Exception as e:
-        logger.warning(f"Failed to initialize Developer API: {e}")
-
-    creds_file = os.path.join(CONFIG_DIR, "credentials_native.json")
-    if not os.path.exists(creds_file):
-        creds_file = os.path.join(CONFIG_DIR, "credentials.json")
-
-    if not os.path.exists(creds_file):
-        logger.warning(f"No credentials found in {CONFIG_DIR}. Waiting for setup via UI.")
-        return True  # Allow server to start in 'setup mode'
-
-    native_creds = {}
-    try:
-        with open(creds_file, "r") as f:
-            native_creds = json.load(f)
-        logger.info(f"Loaded credentials from {creds_file}")
-    except Exception as e:
-        logger.error(f"Error reading credentials: {e}")
+    creds = read_credentials()
+    host = (creds.get("host") or "").strip()
+    token = (creds.get("token") or "").strip()
+    if not host or not token:
+        logger.warning("credentials.json missing host or token. Waiting for setup via UI.")
         return True
 
-    # Store session file in config directory to avoid conflicts between instances
-    session_file = os.path.join(CONFIG_DIR, ".unifi_access_session")
-    native_api = UniFiNativeAPI(
-        host=f"https://{native_creds.get('host', '')}",
-        username=native_creds.get("username", "admin"),
-        password=native_creds.get("password", native_creds.get("token", "")),
-        session_file=session_file,
-    )
-
-    # Try to load session
-    if not native_api.login():
-        logger.error("Failed to login to UniFi Access Controller. /login endpoint required.")
+    access = UniFiAccess(host=host, token=token)
+    if not access.healthcheck():
+        logger.error(f"UniFi Access controller at {host}:12445 rejected the token.")
+        # Don't abort startup — the UI's /setup flow can replace the token.
+        access = None
         return True
+    logger.info(f"Access API connected to {host}.")
 
-    # Populate native devices cache
-    populate_native_devices_cache()
+    # Optional Protect Integration for live camera snapshots
+    protect_key = (creds.get("protect_api_key") or "").strip()
+    if protect_key:
+        try:
+            protect = UniFiProtect(host=host, api_key=protect_key)
+            if protect.healthcheck():
+                logger.info("Protect API connected.")
+            else:
+                logger.warning("Protect API key rejected; snapshots disabled.")
+                protect = None
+        except Exception as e:
+            logger.warning(f"Protect init failed: {e}")
+            protect = None
 
-    # Populate door thumbnails
+    populate_devices_cache()
+    populate_camera_index()
     refresh_thumbnail_cache()
 
     schedule_manager = init_schedule_manager()
-
-    # Initialize event log
-    global event_log
     event_log = init_event_log()
 
-    # Sync state on startup (handle expired holds, re-inject missing schedules)
+    # Real-time events
     try:
-        sync_results = schedule_manager.sync_state()
-        logger.info(f"State sync: {len(sync_results['expired'])} expired, {len(sync_results['reinjected'])} reinjected")
+        event_stream = AccessEventStream(access, handle_websocket_event)
+        event_stream.start()
+        logger.info("WebSocket event stream started.")
     except Exception as e:
-        logger.warning(f"State sync failed: {e}")
+        logger.warning(f"WebSocket event stream failed to start: {e}")
 
-    # Initialize WebSocket for real-time events
-    global access_websocket
-    try:
-        access_websocket = UniFiAccessWebSocket(native_api)
-        access_websocket.on_event(handle_websocket_event)
-        access_websocket.connect()
-        logger.info("WebSocket client started")
-    except Exception as e:
-        logger.warning(f"WebSocket init failed: {e}")
-
-    logger.info("API Initialized successfully")
+    logger.info("API initialized successfully")
     return True
 
 
-def get_custom_site_name():
-    """Get custom site name from credentials file."""
-    try:
-        creds_path = get_config_path("credentials_native.json")
-        if os.path.exists(creds_path):
-            with open(creds_path, "r") as f:
-                creds = json.load(f)
-                return creds.get("site_name")
-    except Exception:
-        pass
-    return None
+def get_custom_site_name() -> str | None:
+    """Custom site name from credentials.json (set via /config/update)."""
+    return read_credentials().get("site_name")
+
+
+# Site-name cache for the unauthenticated /api/system probe on port 443.
+# The site name doesn't change in normal operation, so fetching it on every
+# /config GET adds a 2s-timeout network round-trip for no benefit.
+_console_name_cache: dict = {"value": None, "fetched_at": 0.0, "ttl": 3600.0}
+
+
+def _cached_console_name(host: str) -> str | None:
+    now = time.time()
+    if (
+        _console_name_cache["value"] is not None
+        and now - _console_name_cache["fetched_at"] < _console_name_cache["ttl"]
+    ):
+        return _console_name_cache["value"]
+    name = fetch_console_name(host)
+    if name is not None:
+        _console_name_cache["value"] = name
+        _console_name_cache["fetched_at"] = now
+    return name
 
 
 @app.route("/config", methods=["GET"])
 def get_config_status():
-    is_configured = native_api is not None
-    is_connected = native_api.logged_in if native_api else False
-    host = native_api.host if native_api else None
-    username = native_api.username if native_api else None
+    is_configured = access is not None
+    is_connected = access.healthcheck() if access else False
+    host = access.host if access else None
 
-    # Prioritize custom name -> dynamic name -> default
     custom_name = get_custom_site_name()
     if custom_name:
         site_name = custom_name
-    elif is_connected:
-        site_name = native_api.get_site_name()
+    elif host:
+        site_name = _cached_console_name(host) or "UniFi Gate"
     else:
-        site_name = "Home Access"
+        site_name = "UniFi Gate"
 
-    site_timezone = native_api.get_site_timezone() if is_connected else None
     is_past_6pm = schedule_manager.is_past_6pm() if schedule_manager else False
 
-    # Get user admin status
     _, is_admin = get_verified_user()
 
     return jsonify(
@@ -408,9 +484,8 @@ def get_config_status():
             "configured": is_configured,
             "connected": is_connected,
             "host": host,
-            "username": username,
+            "username": None,  # bearer-token auth: no user concept here
             "site_name": site_name,
-            "site_timezone": site_timezone,
             "is_past_6pm": is_past_6pm,
             "is_admin": is_admin,
         }
@@ -418,198 +493,131 @@ def get_config_status():
 
 
 @app.route("/config/update", methods=["POST"])
+@require_admin
 def update_config():
-    data = request.get_json(silent=True) or {}
-    new_name = data.get("site_name")
+    """Update editable fields in credentials.json (currently: site_name)."""
+    new_name = (request.get_json(silent=True) or {}).get("site_name")
+    if new_name is None:
+        return jsonify({"status": "error", "message": "No site_name provided"}), 400
+    try:
+        update_credentials(site_name=new_name)
+        return jsonify({"status": "success"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-    if new_name is not None:
-        try:
-            creds_path = get_config_path("credentials_native.json")
-            creds = {}
-            # Read existing
-            if os.path.exists(creds_path):
-                with open(creds_path, "r") as f:
-                    creds = json.load(f)
 
-            # Update
-            creds["site_name"] = new_name
+# Host is restricted to hostname/IP characters to prevent /setup from being
+# pointed at arbitrary URLs (even with admin auth, this is a defense-in-depth
+# check before writing to credentials.json).
+_HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.\-]*[A-Za-z0-9])?(?::\d+)?$")
 
-            # Write back
-            with open(creds_path, "w") as f:
-                json.dump(creds, f, indent=4)
-
-            return jsonify({"status": "success"})
-        except Exception as e:
-            return jsonify({"status": "error", "message": str(e)}), 500
-    return jsonify({"status": "error", "message": "No site_name provided"}), 400
+# Serialises /setup so two concurrent admins can't half-swap globals
+# (access, protect, schedule_manager, event_stream) and leave the server
+# in a torn state with mismatched objects.
+_setup_lock = threading.Lock()
 
 
 @app.route("/setup", methods=["POST"])
+@require_admin
 def setup():
-    global native_api, dev_api, schedule_manager, _native_devices_cache
+    """Configure or re-configure the controller connection with a Developer
+    API bearer token. No username/password, no 2FA."""
+    global access, protect, schedule_manager, event_log, event_stream
 
     data = request.get_json(silent=True) or {}
-    host = data.get("host", "").strip()
-    username = data.get("username", "admin").strip()
-    password = data.get("password", "").strip()
-    token = data.get("token", "").strip()  # 2FA
-    site_name = data.get("site_name", "").strip()
+    host = (data.get("host") or "").strip().replace("https://", "").replace("http://", "").rstrip("/")
+    token = (data.get("token") or "").strip()
+    site_name = (data.get("site_name") or "").strip()
+    site_timezone = (data.get("site_timezone") or "").strip()
+    protect_api_key = (data.get("protect_api_key") or "").strip()
 
-    if not host or not password:
-        return jsonify({"status": "error", "message": "Host and Password are required"}), 400
+    if not host or not token:
+        return jsonify({"status": "error", "message": "host and token are required"}), 400
+    if not _HOST_RE.match(host):
+        return jsonify({"status": "error", "message": "host must be a hostname or IP"}), 400
 
-    # Initialize temp API to test connection
-    if not host.startswith("http"):
-        host = f"https://{host}"
+    # Verify the token works before persisting.
+    candidate = UniFiAccess(host=host, token=token)
+    if not candidate.healthcheck():
+        return (
+            jsonify(
+                {"status": "error", "message": "Token rejected by controller. Check host and Developer API token."}
+            ),
+            401,
+        )
 
-    temp_api = UniFiNativeAPI(host=host, username=username, password=password)
-
-    # Attempt login
-    if temp_api.login(auth_code=token if token else None, force_new=True):
-        # Success! Save credentials
-        creds = {
-            "host": host.replace("https://", "").replace("http://", "").rstrip("/"),
-            "username": username,
-            "password": password,
-        }
-        if site_name:
-            creds["site_name"] = site_name
-
+    if not _setup_lock.acquire(blocking=False):
+        return jsonify({"status": "error", "message": "Another setup is in progress."}), 409
+    try:
+        # Merge with existing credentials so unrelated fields (e.g. protect_api_key
+        # not in this POST body) aren't wiped on re-setup.
         try:
-            with open("credentials_native.json", "w") as f:
-                json.dump(creds, f, indent=4)
+            update_credentials(
+                host=host,
+                token=token,
+                site_name=site_name,
+                site_timezone=site_timezone,
+                protect_api_key=protect_api_key,
+            )
         except Exception as e:
-            return jsonify({"status": "error", "message": f"Login success but failed to save file: {e}"}), 500
+            return jsonify({"status": "error", "message": f"Token works but failed to save credentials: {e}"}), 500
 
-        # Promote to global
-        native_api = temp_api
+        # Promote to globals and rebuild dependent state.
+        access = candidate
+        _console_name_cache["value"] = None  # host may have changed; force re-fetch
+        if protect_api_key:
+            try:
+                protect = UniFiProtect(host=host, api_key=protect_api_key)
+                if not protect.healthcheck():
+                    protect = None
+                    logger.warning("Protect API key rejected; snapshots disabled.")
+            except Exception as e:
+                logger.warning(f"Protect setup failed: {e}")
+                protect = None
+        else:
+            protect = None
 
-        # Re-initialize Developer API (it reloads its own creds)
-        try:
-            if os.path.exists("credentials.json"):  # UnifiAccessAPI uses this
-                dev_api = UnifiAccessAPI()
-                logger.info("Developer API re-initialized")
-        except Exception as e:
-            logger.warning(f"Failed to re-initialize Developer API: {e}")
-
-        # Re-populate native devices cache
-        populate_native_devices_cache()
+        populate_devices_cache()
+        populate_camera_index()
         refresh_thumbnail_cache()
 
         schedule_manager = init_schedule_manager()
-
-        # Initialize event log
-        global event_log
         event_log = init_event_log()
 
-        # Sync state after login
+        # Restart the event stream so it picks up the new bearer token.
+        if event_stream is not None:
+            try:
+                event_stream.stop()
+            except Exception:
+                pass
         try:
-            schedule_manager.sync_state()
+            event_stream = AccessEventStream(access, handle_websocket_event)
+            event_stream.start()
         except Exception as e:
-            logger.warning(f"State sync failed: {e}")
+            logger.warning(f"WebSocket restart failed: {e}")
 
-        # Log the login
-        user = request.headers.get("Cf-Access-Authenticated-User-Email", username)
+        user = request.headers.get("Cf-Access-Authenticated-User-Email", "setup")
         if event_log:
             event_log.log_login(user, success=True)
 
-        return jsonify({"status": "success", "message": "Connected and saved!"})
+        return jsonify({"status": "success", "message": "Connected and saved."})
+    finally:
+        _setup_lock.release()
 
-    return jsonify({"status": "error", "message": "Login failed. Check credentials or provide 2FA token."}), 401
 
-
+# /login removed: bearer-token auth has no per-session login. Kept as a
+# 410 Gone so old clients get a clear signal.
 @app.route("/login", methods=["POST"])
-def login():
-    global schedule_manager, _native_devices_cache
-    if not native_api:
-        return jsonify({"error": "API client not configured"}), 500
-
-    data = request.get_json(silent=True) or {}
-    token = data.get("token")
-
-    # Attempt login (force new if token provided)
-    force = True if token else False
-
-    if native_api.login(auth_code=token, force_new=force):
-        schedule_manager = init_schedule_manager()
-        # Re-populate native devices cache after login
-        populate_native_devices_cache()
-        refresh_thumbnail_cache()
-
-        # Sync state after login
-        try:
-            schedule_manager.sync_state()
-        except Exception as e:
-            logger.warning(f"State sync failed: {e}")
-
-        # Log the login
-        user = request.headers.get("Cf-Access-Authenticated-User-Email", "admin")
-        if event_log:
-            event_log.log_login(user, success=True)
-
-        return jsonify({"status": "success", "message": "Login successful"})
-
-    return jsonify({"status": "error", "message": "Login failed. Check 2FA or credentials."}), 401
-
-
-def get_verified_user() -> tuple[str, bool]:
-    """
-    Get the verified user email and admin status.
-
-    Priority order:
-    1. X-Verified-User header (from Cloudflare Worker after JWT validation)
-    2. Cf-Access-Authenticated-User-Email header (legacy Cloudflare Access)
-    3. "Guest" if in dev mode, otherwise None (unauthenticated)
-
-    Returns: (email, is_admin)
-    """
-    # Check Worker-verified user first
-    verified_user = request.headers.get("X-Verified-User")
-    if verified_user:
-        is_admin = user_store.is_admin(verified_user) if user_store else False
-        return verified_user, is_admin
-
-    # Fall back to Cloudflare Access header
-    cf_user = request.headers.get("Cf-Access-Authenticated-User-Email")
-    if cf_user:
-        is_admin = user_store.is_admin(cf_user) if user_store else False
-        return cf_user, is_admin
-
-    # In dev mode, allow Guest access
-    if DEV_MODE:
-        return "Guest", True  # Guest is admin in dev mode for testing
-
-    return None, False
-
-
-def require_auth(f):
-    """Decorator to require authentication (skipped in dev mode)."""
-    from functools import wraps
-
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        user, _ = get_verified_user()
-        if user is None:
-            return jsonify({"error": "Authentication required"}), 401
-        return f(*args, **kwargs)
-
-    return decorated_function
-
-
-def require_admin(f):
-    """Decorator to require admin role (skipped in dev mode)."""
-    from functools import wraps
-
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        user, is_admin = get_verified_user()
-        if user is None:
-            return jsonify({"error": "Authentication required"}), 401
-        if not is_admin:
-            return jsonify({"error": "Admin access required"}), 403
-        return f(*args, **kwargs)
-
-    return decorated_function
+def login_gone():
+    return (
+        jsonify(
+            {
+                "status": "error",
+                "message": "Login is no longer required — UniFi Gate now uses a Developer API token. Use /setup to configure.",
+            }
+        ),
+        410,
+    )
 
 
 @app.route("/favicon.ico")
@@ -621,12 +629,8 @@ def favicon():
 @app.route("/health", methods=["GET"])
 def health():
     """Health check endpoint. Returns 200 if healthy, 503 if not."""
-    if not native_api or not native_api.logged_in:
+    if not access or not access.healthcheck():
         return jsonify({"status": "unhealthy", "controller_connected": False}), 503
-
-    if not native_api._validate_session():
-        return jsonify({"status": "unhealthy", "controller_connected": False}), 503
-
     return jsonify({"status": "healthy", "controller_connected": True})
 
 
@@ -664,126 +668,104 @@ def admin():
 
 @app.route("/devices", methods=["GET"])
 def list_devices():
-    # Use Developer API for listing if available, else fall back to Native
-    if dev_api:
-        try:
-            doors = dev_api.get_doors()
-            doors_json = []
-            for d in doors:
-                door_data = {
-                    "id": d.id,
-                    "name": d.name,
-                    "is_online": True,
-                    "status": d.display_status,
-                    "imageUrl": None,  # Default to None
-                }
-
-                # 1. Try live thumbnail first (Best)
-                if d.id in _door_thumbnails:
-                    door_data["imageUrl"] = f"/door-image/{d.id}"
-
-                # 2. Fallback to static device icon (Good)
-                if not door_data["imageUrl"]:
-                    # Try to find image from native devices cache
-                    for native_dev in _native_devices_cache:
-                        # Case 1: Physical device itself is the door
-                        if native_dev.get("unique_id") == d.id:
-                            if "images" in native_dev and "xs" in native_dev["images"]:
-                                door_data["imageUrl"] = native_dev["images"]["xs"]
-                                break
-                        # Case 2: Physical device has extensions mapping to doors
-                        if "extensions" in native_dev and isinstance(native_dev["extensions"], list):
-                            for ext in native_dev["extensions"]:
-                                if ext.get("target_type") == "door" and ext.get("target_value") == d.id:
-                                    if "images" in native_dev and "xs" in native_dev["images"]:
-                                        door_data["imageUrl"] = native_dev["images"]["xs"]
-                                        break
-                            if door_data["imageUrl"]:
-                                break
-
-                doors_json.append(door_data)
-
-            doors_json.sort(key=lambda x: x["name"])
-            return jsonify(doors_json)
-        except Exception as e:
-            logger.error(f"Dev API list failed: {e}")
-
-    if not native_api:
+    if not access:
         return jsonify({"error": "API not initialized"}), 500
+    try:
+        doors = access.list_doors()
+    except UnifiAccessError as e:
+        logger.error(f"list_doors failed: {e}")
+        return jsonify({"error": str(e)}), 502
 
-    doors = native_api.get_doors()
-    # Convert NativeDoor objects to JSON-serializable dicts
-    doors_json = [
-        {
-            "id": d.id,
-            "name": d.name,
-            "is_online": d.is_online,
-            "status": d.display_status,
-            "imageUrl": None,  # No image if only native list is used
-        }
-        for d in doors
-    ]
+    doors_json = []
+    for d in doors:
+        # Status reads like the legacy display_status (open/closed + lock state).
+        if d.open:
+            status = "open"
+        elif d.locked:
+            status = "locked"
+        else:
+            status = "unlocked"
 
-    # Add images from thumbnail cache if available
-    for d in doors_json:
-        if d["id"] in _door_thumbnails:
-            d["imageUrl"] = f"/door-image/{d['id']}"
+        # imageUrl is set only when a real image is available (Protect camera
+        # or Access /preview thumbnail). Cameraless doors get null so the
+        # frontend renders its round-circle lock-icon fallback instead of
+        # squeezing the placeholder SVG into the wide-rect slot.
+        has_real_image = d.id in _door_to_camera or d.id in _door_thumbnails
 
+        hold = schedule_manager.get_hold_state_data(d.id) if schedule_manager else dict(EMPTY_HOLD_STATE)
+        doors_json.append(
+            {
+                "id": d.id,
+                "name": d.name,
+                "is_online": True,
+                "status": status,
+                "imageUrl": f"/door-image/{d.id}" if has_real_image else None,
+                **hold,
+            }
+        )
     doors_json.sort(key=lambda x: x["name"])
-
     return jsonify(doors_json)
 
 
 @app.route("/door-image/<door_id>", methods=["GET"])
 def get_door_image(door_id):
-    if not native_api:
-        return jsonify({"error": "API not initialized"}), 500
+    """Serve a door image. Priority:
+      1. Access /preview thumbnail — last access event capture. Most events
+         happen in daylight (people coming and going) so this is usually a
+         bright, cover-like image. Functions as our 'cover' replacement.
+      2. Protect live snapshot — current frame. Used only as a fallback
+         because at night it's just a dark picture of nothing.
+      3. Placeholder SVG — when no camera is bound at all.
 
-    path = _door_thumbnails.get(door_id)
+    Pass `?fresh=1` to force the live Protect snapshot (skipping the cover).
+    """
+    if access:
+        prefer_fresh = request.args.get("fresh") in ("1", "true", "yes")
 
-    # If missing, try ONE refresh
-    if not path:
-        logger.info(f"Thumbnail miss for {door_id}, refreshing cache...")
-        refresh_thumbnail_cache()
-        path = _door_thumbnails.get(door_id)
+        # 1) Access /preview thumbnail — our cover-equivalent
+        if not prefer_fresh:
+            path = _door_thumbnails.get(door_id)
+            if not path:
+                refresh_thumbnail_cache()
+                path = _door_thumbnails.get(door_id)
+            if path:
+                try:
+                    img = access.fetch_thumbnail(path)
+                    return Response(img, mimetype="image/jpeg")
+                except UnifiAccessError as e:
+                    logger.warning(f"Access thumbnail for {door_id} failed: {e}")
 
-    if not path:
-        logger.warning(f"Thumbnail not found for door {door_id}")
-        return jsonify({"error": "Thumbnail not found"}), 404
+        # 2) Protect live snapshot — current frame, can be dark at night
+        cam = _door_to_camera.get(door_id)
+        if protect and cam:
+            try:
+                img = protect.fetch_camera_snapshot(cam.id)
+                return Response(img, mimetype="image/jpeg")
+            except UnifiAccessError as e:
+                logger.warning(f"Protect snapshot for {door_id} failed: {e}")
 
-    full_url = f"{native_api.host}/proxy/access{path}"
-    try:
-        # Stream response to client
-        resp = native_api.session.get(full_url, stream=True, verify=False)
-        if resp.status_code == 200:
-            return Response(resp.content, mimetype=resp.headers.get("Content-Type"))
-        else:
-            logger.error(f"Failed to fetch image from controller: {resp.status_code} for {full_url}")
-            return jsonify({"error": "Failed to fetch image from controller"}), resp.status_code
-    except Exception as e:
-        logger.error(f"Exception fetching image: {e}")
-        return jsonify({"error": str(e)}), 500
+    # 3) Placeholder for cameraless doors
+    return app.send_static_file("door-placeholder.svg")
 
 
 @app.route("/status/<device_id>", methods=["GET"])
 def get_status(device_id):
-    if not native_api:
+    if not schedule_manager:
         return jsonify({"error": "API not initialized"}), 500
-
     state_data = schedule_manager.get_hold_state_data(device_id)
     return jsonify({"device_id": device_id, **state_data})
 
 
 def get_device_name(device_id: str) -> str:
-    """Get device name from cache or return device_id."""
-    if dev_api:
-        try:
-            doors = dev_api.get_doors()
-            for d in doors:
-                if d.id == device_id:
-                    return d.name
-        except:
-            pass
+    """Look up a door name from the access API; falls back to the id."""
+    if not access:
+        return device_id
+    try:
+        for d in access.list_doors():
+            if d.id == device_id:
+                return d.name
+    except UnifiAccessError:
+        pass
     return device_id
 
 
@@ -793,93 +775,72 @@ def get_user_email() -> str:
     return user or "unknown"
 
 
+def log_admin(verb: str, target: str = "") -> None:
+    """Log an admin action against the current user; no-op if event_log is unset."""
+    if event_log:
+        event_log.log_admin_action(get_user_email(), verb, target)
+
+
 @app.route("/unlock/<device_id>", methods=["POST"])
 def unlock(device_id):
+    if not access:
+        return jsonify({"error": "API not initialized"}), 500
     user = get_user_email()
     device_name = get_device_name(device_id)
+    try:
+        access.unlock(device_id)
+    except UnifiAccessError as e:
+        logger.error(f"unlock {device_id} failed: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 502
 
-    # Prefer Developer API for momentary unlock as we know the endpoint works
-    if dev_api:
-        try:
-            if dev_api.unlock_door(device_id):
-                if event_log:
-                    event_log.log_unlock(user, device_id, device_name)
-                return jsonify({"status": "success", "action": "unlock"})
-            return jsonify({"status": "error", "message": "Failed to unlock via Dev API"}), 500
-        except Exception as e:
-            logger.error(f"Dev API unlock failed: {e}")
+    if event_log:
+        event_log.log_unlock(user, device_id, device_name)
+    return jsonify({"status": "success", "action": "unlock"})
 
-    if not native_api:
-        return jsonify({"error": "API not initialized"}), 500
 
-    if native_api.unlock_door(device_id):
+def _hold_endpoint(device_id: str, action: str, run_op, log_event):
+    """Shared /hold/* handler: gate on schedule_manager, run op, log, return JSON."""
+    error = require_schedule_manager()
+    if error:
+        return error
+    user = get_user_email()
+    device_name = get_device_name(device_id)
+    if run_op():
         if event_log:
-            event_log.log_unlock(user, device_id, device_name)
-        return jsonify({"status": "success", "action": "unlock"})
-    return jsonify({"status": "error", "message": "Failed to unlock"}), 500
+            log_event(user, device_id, device_name)
+        return jsonify({"status": "success", "action": action})
+    return jsonify({"status": "error", "message": f"Failed: {action}"}), 500
 
 
 @app.route("/hold/today/<device_id>", methods=["POST"])
 def hold_today(device_id):
-    error = require_schedule_manager()
-    if error:
-        return error
-
-    user = get_user_email()
-    device_name = get_device_name(device_id)
-
-    # Get optional end_time from request body
-    data = request.get_json(silent=True) or {}
-    end_time = data.get("end_time")  # Format: "HH:MM" (24-hour), defaults to 18:00
-
-    if schedule_manager.inject_hold_open(device_id, end_time=end_time):
-        if event_log:
-            event_log.log_hold_today(user, device_id, device_name, end_time or "18:00")
-        return jsonify({"status": "success", "action": "hold_today"})
-    return jsonify({"status": "error", "message": "Failed to inject schedule"}), 500
+    end_time = (request.get_json(silent=True) or {}).get("end_time")  # "HH:MM", default 18:00
+    return _hold_endpoint(
+        device_id,
+        "hold_today",
+        lambda: schedule_manager.inject_hold_open(device_id, end_time=end_time),
+        lambda u, i, n: event_log.log_hold_today(u, i, n, end_time or "18:00"),
+    )
 
 
 @app.route("/hold/forever/<device_id>", methods=["POST"])
 def hold_forever(device_id):
-    error = require_schedule_manager()
-    if error:
-        return error
-
-    user = get_user_email()
-    device_name = get_device_name(device_id)
-
-    if schedule_manager.inject_hold_open_forever(device_id):
-        if event_log:
-            event_log.log_hold_forever(user, device_id, device_name)
-        return jsonify({"status": "success", "action": "hold_forever"})
-    return jsonify({"status": "error", "message": "Failed to inject schedule"}), 500
+    return _hold_endpoint(
+        device_id,
+        "hold_forever",
+        lambda: schedule_manager.inject_hold_open_forever(device_id),
+        event_log.log_hold_forever,
+    )
 
 
 @app.route("/hold/stop/<device_id>", methods=["POST"])
 def stop_hold(device_id):
-    error = require_schedule_manager()
-    if error:
-        return error
-
-    user = get_user_email()
-    device_name = get_device_name(device_id)
-
-    if schedule_manager.remove_hold_open(device_id):
-        if event_log:
-            event_log.log_stop_hold(user, device_id, device_name)
-        return jsonify({"status": "success", "action": "stop_hold"})
-    return jsonify({"status": "error", "message": "Failed to remove schedule"}), 500
-
-
-@app.route("/force-sync/<device_id>", methods=["POST"])
-def force_sync(device_id):
-    """Force sync a device's schedule to match local state."""
-    error = require_schedule_manager()
-    if error:
-        return error
-
-    result = schedule_manager.force_sync_device(device_id)
-    return jsonify(result)
+    return _hold_endpoint(
+        device_id,
+        "stop_hold",
+        lambda: schedule_manager.remove_hold_open(device_id),
+        event_log.log_stop_hold,
+    )
 
 
 @app.route("/events", methods=["GET"])
@@ -907,7 +868,7 @@ def get_websocket_events():
 
     return jsonify(
         {
-            "connected": access_websocket.is_connected() if access_websocket else False,
+            "connected": event_stream.is_connected() if event_stream else False,
             "event_count": len(_websocket_events),
             "events": events,
         }
@@ -916,133 +877,72 @@ def get_websocket_events():
 
 @app.route("/debug/<device_id>", methods=["GET"])
 def get_debug_info(device_id):
-    """Get raw debug info for a door (UniFi API + local state)."""
-    if not native_api:
+    """Get raw debug info for a door (Developer API + local state)."""
+    if not access:
         return jsonify({"error": "API not initialized"}), 500
 
     result = {
         "unifi": {
-            "physical_device": None,  # The hardware (UA-Hub, UA-Gate, etc.)
-            "door": None,  # The logical door from topology
+            "physical_device": None,
+            "door": None,
             "schedule": None,
             "hardware_status": None,
         },
-        "local": {
-            "hold_state": None,
-            "journal_entries": [],
-        },
         "websocket": {
-            "connected": access_websocket.is_connected() if access_websocket else False,
+            "connected": event_stream.is_connected() if event_stream else False,
             "recent_events": [],
         },
     }
 
-    # Get real-time hardware status from dev API or native API
+    # Hardware status (lock relay + door position) from /doors
     try:
-        if dev_api:
-            doors = dev_api.get_doors()
-            for d in doors:
-                if d.id == device_id:
-                    result["unifi"]["hardware_status"] = {
-                        "door_lock_relay_status": d.door_lock_relay_status,
-                        "door_position_status": d.door_position_status,
-                        "is_bind_hub": d.is_bind_hub,
-                    }
-                    break
-        elif native_api:
-            doors = native_api.get_doors()
-            for d in doors:
-                if d.id == device_id:
-                    result["unifi"]["hardware_status"] = {
-                        "door_lock_relay_status": d.door_lock_relay_status,
-                        "door_position_status": d.door_position_status,
-                        "is_online": d.is_online,
-                    }
-                    break
-    except Exception as e:
-        logger.error(f"Failed to get hardware status: {e}")
-
-    # Find the physical device that manages this door (from native devices cache)
-    try:
-        for native_dev in _native_devices_cache:
-            # Check if this device has an extension mapping to our door
-            extensions = native_dev.get("extensions", [])
-            if isinstance(extensions, list):
-                for ext in extensions:
-                    if ext.get("target_type") == "door" and ext.get("target_value") == device_id:
-                        result["unifi"]["physical_device"] = {
-                            "unique_id": native_dev.get("unique_id"),
-                            "name": native_dev.get("name"),
-                            "model": native_dev.get("model"),
-                            "firmware": native_dev.get("firmware"),
-                            "ip": native_dev.get("ip"),
-                            "mac": native_dev.get("mac"),
-                            "is_online": native_dev.get("is_online"),
-                            "is_connected": native_dev.get("is_connected"),
-                            "device_type": native_dev.get("device_type"),
-                            "hw_type": native_dev.get("hw_type"),
-                            "configs": native_dev.get("configs", []),
-                        }
-                        break
-            # Also check if the device itself is the door (some device types)
-            if native_dev.get("location_id") == device_id:
-                result["unifi"]["physical_device"] = {
-                    "unique_id": native_dev.get("unique_id"),
-                    "name": native_dev.get("name"),
-                    "model": native_dev.get("model"),
-                    "firmware": native_dev.get("firmware"),
-                    "ip": native_dev.get("ip"),
-                    "mac": native_dev.get("mac"),
-                    "is_online": native_dev.get("is_online"),
-                    "is_connected": native_dev.get("is_connected"),
-                    "device_type": native_dev.get("device_type"),
-                    "hw_type": native_dev.get("hw_type"),
-                    "configs": native_dev.get("configs", []),
+        for d in access.list_doors():
+            if d.id == device_id:
+                result["unifi"]["hardware_status"] = {
+                    "door_lock_relay_status": "lock" if d.locked else "unlock",
+                    "door_position_status": "open" if d.open else "close",
+                    "is_bind_hub": d.bound_to_hub,
+                }
+                result["unifi"]["door"] = {
+                    "unique_id": d.id,
+                    "name": d.name,
+                    "full_name": d.full_name,
+                    "floor_id": d.floor_id,
+                    "extras": {
+                        "door_cover": d.cover_path,
+                        "door_thumbnail": d.thumbnail_path,
+                        "door_thumbnail_last_update": d.thumbnail_updated_at,
+                    },
                 }
                 break
-    except Exception as e:
-        logger.error(f"Failed to get physical device: {e}")
+    except UnifiAccessError as e:
+        logger.error(f"Failed to get hardware status: {e}")
 
-    # Get door info from topology
+    # Physical device that hosts this door (intercom / hub) from cached /devices
+    for dev in _devices_cache:
+        if dev.location_id == device_id:
+            result["unifi"]["physical_device"] = {
+                "unique_id": dev.id,  # device MAC
+                "name": dev.name,
+                "model": dev.type,
+                "is_online": dev.online,
+                "is_connected": dev.connected,
+                "is_managed": dev.managed,
+                "is_adopted": dev.adopted,
+                "device_type": dev.type,
+                "capabilities": dev.capabilities,
+            }
+            break
+
+    # Current lock_rule (the new replacement for "schedule")
     try:
-        if native_api._bootstrap and "data" in native_api._bootstrap:
-            data = native_api._bootstrap["data"]
-            if isinstance(data, list) and len(data) > 0:
-                main_site = data[0]
-                for floor in main_site.get("floors", []):
-                    for door in floor.get("doors", []):
-                        if door.get("unique_id") == device_id:
-                            # Extract just the door-specific info, not device_groups
-                            result["unifi"]["door"] = {
-                                "unique_id": door.get("unique_id"),
-                                "name": door.get("name"),
-                                "full_name": door.get("full_name"),
-                                "floor": floor.get("name"),
-                                "extras": door.get("extras", {}),
-                            }
-                            break
-    except Exception as e:
-        logger.error(f"Failed to get door from topology: {e}")
-
-    # Get raw schedule info
-    try:
-        schedule_response = native_api.get_unlock_schedule(device_id)
-        result["unifi"]["schedule"] = schedule_response
-    except Exception as e:
-        logger.error(f"Failed to get schedule: {e}")
-
-    # Get local hold state
-    if schedule_manager:
-        try:
-            result["local"]["hold_state"] = schedule_manager.state_manager.get_hold(device_id)
-        except Exception as e:
-            logger.error(f"Failed to get hold state: {e}")
-
-        # Get journal entries
-        try:
-            result["local"]["journal_entries"] = schedule_manager.journal.get_entries_for_device(device_id, limit=20)
-        except Exception as e:
-            logger.error(f"Failed to get journal entries: {e}")
+        state = access.get_hold_state(device_id)
+        result["unifi"]["schedule"] = {
+            "type": state.type.value,
+            "ended_time": state.ended_time,
+        }
+    except UnifiAccessError as e:
+        logger.error(f"Failed to get lock_rule: {e}")
 
     # Get recent WebSocket events for this device
     try:
@@ -1091,11 +991,9 @@ def auth_me():
 
 @app.route("/admin/users", methods=["GET"])
 @require_admin
+@requires_user_store
 def admin_list_users():
     """List all users (admin only)."""
-    error = require_user_store()
-    if error:
-        return error
 
     users = user_store.list_users()
     return jsonify(
@@ -1117,20 +1015,15 @@ def admin_list_users():
 
 @app.route("/admin/users/<email>/approve", methods=["POST"])
 @require_admin
+@requires_user_store
 def admin_approve_user(email):
     """Approve a pending user (admin only)."""
-    error = require_user_store()
-    if error:
-        return error
 
     user = user_store.update_user(email, status=UserStatus.APPROVED)
     if not user:
         return jsonify({"error": "User not found"}), 404
 
-    # Log the approval
-    admin_email = get_user_email()
-    if event_log:
-        event_log.log_admin_action(admin_email, "approve_user", email)
+    log_admin("approve_user", email)
 
     # Auto-sync to Cloudflare KV
     sync_status = sync_users_to_kv(f"approved {email}")
@@ -1140,31 +1033,24 @@ def admin_approve_user(email):
 
 @app.route("/admin/users/<email>/reject", methods=["POST"])
 @require_admin
+@requires_user_store
 def admin_reject_user(email):
     """Reject a user (admin only)."""
-    error = require_user_store()
-    if error:
-        return error
 
     user = user_store.update_user(email, status=UserStatus.REJECTED)
     if not user:
         return jsonify({"error": "User not found"}), 404
 
-    # Log the rejection
-    admin_email = get_user_email()
-    if event_log:
-        event_log.log_admin_action(admin_email, "reject_user", email)
+    log_admin("reject_user", email)
 
     return jsonify({"status": "success", "user": {"email": user.email, "status": user.status}})
 
 
 @app.route("/admin/users/<email>/role", methods=["POST"])
 @require_admin
+@requires_user_store
 def admin_change_role(email):
     """Change user role (admin only)."""
-    error = require_user_store()
-    if error:
-        return error
 
     data = request.get_json(silent=True) or {}
     new_role = data.get("role")
@@ -1178,40 +1064,30 @@ def admin_change_role(email):
     if not user:
         return jsonify({"error": "User not found"}), 404
 
-    # Log the role change
-    admin_email = get_user_email()
-    if event_log:
-        event_log.log_admin_action(admin_email, "change_role", f"{email} -> {new_role}")
+    log_admin("change_role", f"{email} -> {new_role}")
 
     return jsonify({"status": "success", "user": {"email": user.email, "role": user.role}})
 
 
 @app.route("/admin/users/<email>", methods=["DELETE"])
 @require_admin
+@requires_user_store
 def admin_delete_user(email):
     """Delete a user (admin only)."""
-    error = require_user_store()
-    if error:
-        return error
 
     if not user_store.delete_user(email):
         return jsonify({"error": "User not found"}), 404
 
-    # Log the deletion
-    admin_email = get_user_email()
-    if event_log:
-        event_log.log_admin_action(admin_email, "delete_user", email)
+    log_admin("delete_user", email)
 
     return jsonify({"status": "success"})
 
 
 @app.route("/admin/users/add", methods=["POST"])
 @require_admin
+@requires_user_store
 def admin_add_user():
     """Directly add an approved user (admin only). No invite link needed."""
-    error = require_user_store()
-    if error:
-        return error
 
     data = request.get_json(silent=True) or {}
     role = data.get("role", "user")
@@ -1236,9 +1112,7 @@ def admin_add_user():
         invited_by=admin_email,
     )
 
-    # Log the action
-    if event_log:
-        event_log.log_admin_action(admin_email, "add_user", email)
+    log_admin("add_user", email)
 
     # Auto-sync to KV
     sync_status = sync_users_to_kv(f"added {email}")
@@ -1255,11 +1129,9 @@ def admin_add_user():
 
 @app.route("/admin/invite", methods=["POST"])
 @require_admin
+@requires_user_store
 def admin_invite_user():
     """Send an invite email (admin only)."""
-    error = require_user_store()
-    if error:
-        return error
 
     data = request.get_json(silent=True) or {}
 
@@ -1308,20 +1180,16 @@ def admin_invite_user():
             }
         )
 
-    # Log the invite
-    if event_log:
-        event_log.log_admin_action(admin_email, "invite_user", email)
+    log_admin("invite_user", email)
 
     return jsonify({"status": "success", "message": f"Invite sent to {email}"})
 
 
 @app.route("/admin/invites", methods=["GET"])
 @require_admin
+@requires_user_store
 def admin_list_invites():
     """List pending invites (admin only)."""
-    error = require_user_store()
-    if error:
-        return error
 
     invites = user_store.list_invites()
     return jsonify(
@@ -1343,20 +1211,15 @@ def admin_list_invites():
 
 @app.route("/admin/invites/<token>/approve", methods=["POST"])
 @require_admin
+@requires_user_store
 def admin_approve_invite(token):
     """Pre-approve a pending invite (admin only)."""
-    error = require_user_store()
-    if error:
-        return error
 
     invite = user_store.set_invite_auto_approve(token, True)
     if not invite:
         return jsonify({"error": "Invite not found"}), 404
 
-    # Log the action
-    admin_email = get_user_email()
-    if event_log:
-        event_log.log_admin_action(admin_email, "pre_approve_invite", invite.email)
+    log_admin("pre_approve_invite", invite.email)
 
     return jsonify(
         {
@@ -1374,11 +1237,9 @@ def admin_approve_invite(token):
 
 
 @app.route("/invite/<token>", methods=["GET"])
+@requires_user_store
 def validate_invite(token):
     """Validate an invite token (public endpoint)."""
-    store_error = require_user_store()
-    if store_error:
-        return store_error
 
     is_valid, email, error = user_store.validate_invite(token)
 
@@ -1401,6 +1262,7 @@ def validate_invite(token):
 
 
 @app.route("/invite/<token>/accept", methods=["POST"])
+@requires_user_store
 def accept_invite(token):
     """
     Accept an invite and create a pending user.
@@ -1408,9 +1270,6 @@ def accept_invite(token):
     The email in the request body must match the invite email.
     This is called after the user signs in with Firebase.
     """
-    error = require_user_store()
-    if error:
-        return error
 
     data = request.get_json(silent=True) or {}
     is_valid, email = validate_email(data.get("email", ""))
@@ -1477,9 +1336,9 @@ if __name__ == "__main__":
         logger.warning("Cloudflare KV sync not configured - approvals won't auto-sync")
 
     if init_api():
-        # Start periodic sync thread
-        sync_thread = threading.Thread(target=run_periodic_sync, daemon=True)
-        sync_thread.start()
+        # Start mDNS advertisement
+        start_mdns(args.port)
+        atexit.register(stop_mdns)
 
         # Run on all interfaces so Docker/Cloudflare can reach it easily
         app.run(host="0.0.0.0", port=args.port, debug=args.debug)

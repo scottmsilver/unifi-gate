@@ -30,6 +30,7 @@ test_wizard/
 tt/
 .gstack/
 .context/
+.superpowers/
 
 # Worker real config (use wrangler.toml.example as template)
 worker/wrangler.toml

@@ -12,18 +12,29 @@ REMOTE_DIR="/opt/unifi-gate"
 # Application files to deploy (code only — credentials/state are NOT overwritten)
 APP_FILES=(
     server.py
-    unifi_native_api.py
-    unifi_access_api.py
-    unifi_websocket.py
+    unifi_access.py
+    unifi_protect.py
     schedule_manager.py
-    schedule_journal.py
-    hold_state_manager.py
     user_store.py
     invite_manager.py
     event_log.py
     kv_sync.py
     manage_users.py
     requirements.txt
+)
+
+# Legacy files that must be removed from the container (no longer used)
+LEGACY_FILES=(
+    unifi_native_api.py
+    unifi_access_api.py
+    unifi_websocket.py
+    hold_state_manager.py
+    schedule_journal.py
+    credentials_native.json
+    hold_state.json
+    schedule_journal.log
+    .unifi_access_session
+    native_session.json
 )
 
 TEMPLATE_FILES=(
@@ -33,18 +44,24 @@ TEMPLATE_FILES=(
 
 STATIC_FILES=(
     static/favicon.svg
+    static/door-placeholder.svg
 )
 
 # Credentials/state files — only deployed if missing in container
 STATE_FILES=(
     credentials.json
-    credentials_native.json
     users.json
-    hold_state.json
     .env
 )
 
 echo "==> Deploying to container: $CONTAINER"
+
+# Clean up legacy files (silently, before pushing new code)
+cleanup_legacy() {
+    for f in "${LEGACY_FILES[@]}"; do
+        incus exec "$CONTAINER" -- rm -f "$REMOTE_DIR/$f" 2>/dev/null || true
+    done
+}
 
 # Check container exists and start it if stopped
 STATE=$(incus list "$CONTAINER" --format csv -c s 2>/dev/null || true)
@@ -57,6 +74,9 @@ elif [ "$STATE" != "RUNNING" ]; then
     echo "    Waiting for container to be ready..."
     sleep 5
 fi
+
+echo "==> Removing legacy files (cookie API + session caches)..."
+cleanup_legacy
 
 # Push application code
 echo "==> Pushing application code..."
