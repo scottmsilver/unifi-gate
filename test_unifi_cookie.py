@@ -125,22 +125,24 @@ def test_login_clears_stale_cookies_before_authenticating(client):
 
 
 _TOPOLOGY_FIXTURE = {
-    "data": {
-        "floors": [
-            {
-                "doors": [
-                    {
-                        "unique_id": "door-1",
-                        "extras": {"door_cover": "/location_cover/door-1_111.jpg"},
-                    },
-                    {
-                        "unique_id": "door-2",
-                        "extras": {"door_cover": None},  # no cover uploaded
-                    },
-                ]
-            }
-        ]
-    }
+    "data": [
+        {
+            "floors": [
+                {
+                    "doors": [
+                        {
+                            "unique_id": "door-1",
+                            "extras": {"door_cover": "/location_cover/door-1_111.jpg"},
+                        },
+                        {
+                            "unique_id": "door-2",
+                            "extras": {"door_cover": None},  # no cover uploaded
+                        },
+                    ]
+                }
+            ]
+        }
+    ]
 }
 
 
@@ -205,7 +207,7 @@ def test_get_cover_busts_bytes_cache_when_path_changes(client):
     _logged_in(client)
     fixture_v1 = json.loads(json.dumps(_TOPOLOGY_FIXTURE))
     fixture_v2 = json.loads(json.dumps(_TOPOLOGY_FIXTURE))
-    fixture_v2["data"]["floors"][0]["doors"][0]["extras"]["door_cover"] = "/location_cover/door-1_222.jpg"
+    fixture_v2["data"][0]["floors"][0]["doors"][0]["extras"]["door_cover"] = "/location_cover/door-1_222.jpg"
 
     topo_v1 = _resp(200, content=json.dumps(fixture_v1).encode(), json_body=fixture_v1)
     topo_v2 = _resp(200, content=json.dumps(fixture_v2).encode(), json_body=fixture_v2)

@@ -237,13 +237,17 @@ class UniFiCookieClient:
     # ---- cover ----
 
     def _fetch_topology(self) -> dict[str, str]:
-        """door_id -> cover relative path. Caller must be logged in."""
+        """door_id -> cover relative path. Caller must be logged in.
+        The controller wraps payloads in {data: [...]} or {data: {...}} depending
+        on firmware — handle both."""
         resp = self._request("GET", _TOPOLOGY_PATH, headers=self._headers())
         self._check_auth(resp)
         if resp.status_code >= 400:
             raise CookieAuthError(f"topology fetch failed: HTTP {resp.status_code}")
-        # data: <dict with floors[].doors[]> for the firmware we target.
-        data = resp.json().get("data") or {}
+        raw = resp.json().get("data") or {}
+        data = raw[0] if isinstance(raw, list) and raw else raw
+        if not isinstance(data, dict):
+            return {}
         out: dict[str, str] = {}
         for floor in data.get("floors", []) or []:
             for door in floor.get("doors", []) or []:
