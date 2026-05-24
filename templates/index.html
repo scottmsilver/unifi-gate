@@ -1053,7 +1053,7 @@
                                                             {(evt.event || '').replace('access.data.', '').replace('access.', '')}
                                                         </span>
                                                         <span className="text-gray-400 ml-auto text-[10px]">
-                                                            {(evt._received_at || '').slice(11, 19)}
+                                                            {evt._received_at ? new Date(evt._received_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : ''}
                                                         </span>
                                                     </div>
                                                 ))}

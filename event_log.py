@@ -35,7 +35,7 @@ class EventLog:
 
     def _append(self, entry: dict) -> None:
         """Append an entry to the log."""
-        entry["timestamp"] = datetime.now().isoformat()
+        entry["timestamp"] = datetime.now(timezone.utc).isoformat()
         try:
             with open(self.log_file, "a") as f:
                 f.write(json.dumps(entry) + "\n")

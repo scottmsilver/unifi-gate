@@ -306,7 +306,7 @@ def init_event_log() -> EventLog:
 def handle_websocket_event(event: dict) -> None:
     """Handle incoming WebSocket event and store in buffer."""
     # Add timestamp
-    event["_received_at"] = datetime.now().isoformat()
+    event["_received_at"] = datetime.now(timezone.utc).isoformat()
     _websocket_events.appendleft(event)
 
     # Log interesting events
