@@ -746,6 +746,8 @@ def list_devices():
                 "name": d.name,
                 "is_online": True,
                 "status": status,
+                "lock_state": "lock" if d.locked else "unlock",
+                "door_position": "open" if d.open else "close",
                 "imageUrl": f"/door-image/{d.id}" if has_real_image else None,
                 **hold,
             }
