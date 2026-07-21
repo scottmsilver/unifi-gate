@@ -6,3 +6,11 @@ pytest==8.3.5
 websocket-client==1.7.0
 python-dotenv
 zeroconf>=0.131.0
+boto3>=1.34
+pycognito>=2024.5.1
+awsiotsdk>=1.21
+# Security: urllib3 < 2.7.0 has PYSEC-2026-141 / PYSEC-2026-142 (transitive via
+# requests/boto3). Pin to the patched release.
+urllib3>=2.7.0
+# viking_monitor: install from the local pi-client checkout (not vendored here):
+#   pip install -e /path/to/viking-vflex-monitor/pi-client

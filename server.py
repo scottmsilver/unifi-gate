@@ -8,7 +8,7 @@ import socket
 import threading
 import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import wraps
 
 from dotenv import load_dotenv
@@ -56,6 +56,7 @@ event_stream: AccessEventStream | None = None
 user_store = None
 invite_manager = None
 kv_client = None
+viking_op = None  # VikingOperator | None (Viking gate-operator telemetry)
 _devices_cache: list = []  # List[Device] from access.list_devices()
 _door_thumbnails: dict = {}  # door_id -> thumbnail_path (e.g. "/preview/...jpg")
 _door_to_camera: dict = {}  # door_id -> protect.Camera (for snapshot fallback)
@@ -455,6 +456,31 @@ def init_api():
     return True
 
 
+def init_viking_operator():
+    """Best-effort: start the Viking operator if configured. Absence/errors are
+    logged and non-fatal — the gate backend runs normally without it."""
+    global viking_op
+    try:
+        from viking_monitor.config import Config
+        from viking_monitor.iot import AwsIotTransport
+        from viking_operator import VikingOperator
+    except Exception as e:
+        logger.info("Viking operator not available (deps missing): %s", e)
+        return
+    try:
+        cfg = Config.from_env(os.environ)
+    except ValueError as e:
+        logger.info("Viking operator not configured: %s", e)
+        return
+    try:
+        op = VikingOperator(cfg, AwsIotTransport(cfg))
+        op.start()
+        viking_op = op
+        logger.info("Viking operator started (serial %s)", cfg.serial)
+    except Exception as e:
+        logger.warning("Viking operator failed to start: %s", e)
+
+
 _COVER_HEARTBEAT_INTERVAL = 12 * 3600  # 12 hours
 
 
@@ -677,6 +703,24 @@ def health():
     if not access or not access.healthcheck():
         return jsonify({"status": "unhealthy", "controller_connected": False}), 503
     return jsonify({"status": "healthy", "controller_connected": True})
+
+
+@app.route("/operator", methods=["GET"])
+def operator_status():
+    """Viking gate-operator telemetry (state + error). Never 5xx on operator
+    faults — an unconfigured/offline operator reports reachable:false."""
+    if viking_op is None:
+        return jsonify(
+            {
+                "reachable": False,
+                "online": None,
+                "updated_at": None,
+                "state": None,
+                "error": {"code": None, "cleared": True, "description": None},
+                "history": [],
+            }
+        )
+    return jsonify(viking_op.snapshot())
 
 
 @app.route("/")
@@ -1480,6 +1524,7 @@ if __name__ == "__main__":
         logger.warning("Cloudflare KV sync not configured - approvals won't auto-sync")
 
     if init_api():
+        init_viking_operator()
         # Start mDNS advertisement
         start_mdns(args.port)
         atexit.register(stop_mdns)

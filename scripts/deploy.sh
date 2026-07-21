@@ -12,6 +12,7 @@ REMOTE_DIR="/opt/unifi-gate"
 # Application files to deploy (code only — credentials/state are NOT overwritten)
 APP_FILES=(
     server.py
+    viking_operator.py
     unifi_access.py
     unifi_protect.py
     unifi_cookie.py
@@ -99,6 +100,18 @@ for f in "${APP_FILES[@]}"; do
         echo "  Warning: $f not found, skipping"
     fi
 done
+
+# Push the viking_monitor package (Viking gate-operator telemetry dependency).
+# Not on PyPI and deliberately NOT vendored into this public repo — ship the
+# package dir from the sibling pi-client checkout into the (private) container.
+VIKING_MONITOR_SRC="${VIKING_MONITOR_SRC:-$PROJECT_DIR/../viking-vflex-monitor/pi-client/viking_monitor}"
+if [ -d "$VIKING_MONITOR_SRC" ]; then
+    echo "==> Pushing viking_monitor package..."
+    incus exec "$CONTAINER" -- rm -rf "$REMOTE_DIR/viking_monitor"
+    incus file push -qr "$VIKING_MONITOR_SRC" "$CONTAINER$REMOTE_DIR/"
+else
+    echo "  Warning: viking_monitor not found at $VIKING_MONITOR_SRC — /operator will be dormant"
+fi
 
 # Push templates
 echo "==> Pushing templates..."
