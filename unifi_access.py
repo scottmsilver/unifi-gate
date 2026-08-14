@@ -76,8 +76,10 @@ class Door:
     id: str
     name: str
     full_name: str
-    locked: bool
-    open: bool
+    # Tri-state on purpose. None means "the controller did not tell us", which
+    # is different from False and must never be rendered as a definite state.
+    locked: Optional[bool]
+    open: Optional[bool]
     floor_id: Optional[str] = None
     bound_to_hub: bool = False
     cover_path: Optional[str] = None
@@ -325,14 +327,29 @@ def fetch_console_name(
 # ---------------------------------------------------------------------------
 
 
+def _tri_state(value, when_true: str, when_false: str) -> Optional[bool]:
+    """Map a controller enum to True/False, or None when it says neither.
+
+    Written as an explicit three-way rather than `value == when_true`, because
+    that idiom silently turns "field absent", "unknown" and "" into False. A
+    door with no position sensor reports exactly those, and the old code
+    rendered it as closed-and-unlocked with full confidence.
+    """
+    if value == when_true:
+        return True
+    if value == when_false:
+        return False
+    return None
+
+
 def _parse_door(d: dict) -> Door:
     extras = d.get("extras") or {}
     return Door(
         id=d["id"],
         name=d["name"],
         full_name=d.get("full_name", d["name"]),
-        locked=d.get("door_lock_relay_status") == "lock",
-        open=d.get("door_position_status") == "open",
+        locked=_tri_state(d.get("door_lock_relay_status"), "lock", "unlock"),
+        open=_tri_state(d.get("door_position_status"), "open", "close"),
         floor_id=d.get("floor_id"),
         bound_to_hub=bool(d.get("is_bind_hub")),
         cover_path=extras.get("door_cover"),

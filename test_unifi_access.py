@@ -398,6 +398,32 @@ def test_parse_door_minimal():
     assert d.cover_path is None
 
 
+def test_parse_door_reports_unknown_rather_than_guessing_unlocked():
+    # THE bug this guards. `locked = d.get(...) == "lock"` collapses a missing or
+    # unrecognised field to False, and server.py then renders False/False as
+    # "unlocked" beside a hardcoded is_online:True. A door we cannot read was
+    # therefore displayed as a confident, online, UNLOCKED gate — the unsafe
+    # direction for a physical door. Unknown must stay unknown.
+    missing = _parse_door({"id": "x", "name": "Y"})
+    assert missing.locked is None, "a missing lock field must not read as unlocked"
+    assert missing.open is None, "a missing position field must not read as closed"
+
+    # An unrecognised value is just as unknown as an absent one. Firmware has
+    # shipped values like "unknown" and "" for doors with no position sensor.
+    for bogus in ("unknown", "", "OPEN_ISH", None):
+        d = _parse_door(
+            {"id": "x", "name": "Y", "door_lock_relay_status": bogus, "door_position_status": bogus}
+        )
+        assert d.locked is None and d.open is None, bogus
+
+
+def test_parse_door_still_reads_the_definite_values():
+    # The tri-state must not cost us the readings we do get. `is False` rather
+    # than `not ...`, because None would satisfy `not ...` and hide a regression.
+    d = _parse_door({"id": "x", "name": "Y", "door_lock_relay_status": "unlock", "door_position_status": "open"})
+    assert d.locked is False and d.open is True
+
+
 def test_parse_device_minimal():
     d = _parse_device({"id": "h", "type": "UGT", "location_id": "lg", "is_online": True})
     assert d.id == "h"

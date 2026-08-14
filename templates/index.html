@@ -542,9 +542,28 @@
             );
         }
 
+        // "4 min ago" beats a raw timestamp on a glanceable dashboard, and beats
+        // a spinner, which reads as "loading" rather than "this may be wrong".
+        function formatAge(seconds) {
+            if (seconds < 60) return `${seconds}s ago`;
+            const mins = Math.floor(seconds / 60);
+            if (mins < 60) return `${mins} min ago`;
+            const hours = Math.floor(mins / 60);
+            if (hours < 24) return `${hours}h ${mins % 60}m ago`;
+            return `${Math.floor(hours / 24)}d ago`;
+        }
+
         function App() {
             const { user, loading: authLoading, isAuthenticated, devMode, signOut } = useAuth();
             const [doors, setDoors] = useState([]);
+            // Freshness tracking. Without this the dashboard silently kept
+            // rendering the last good reading forever when /devices started
+            // failing — a confident "Locked" that could be hours old. For a
+            // physical gate, presenting stale state as current is the dangerous
+            // failure, so the age of the reading is now first-class state.
+            const [lastOkAt, setLastOkAt] = useState(null);
+            const [fetchFailed, setFetchFailed] = useState(false);
+            const [nowTs, setNowTs] = useState(Date.now());
             const [config, setConfig] = useState({ configured: false, connected: false, site_name: 'Access' });
             const [loading, setLoading] = useState(true);
             const [view, setView] = useState('loading');
@@ -573,10 +592,28 @@
                     const res = await authFetch('/devices');
                     if (!res.ok) throw new Error("Failed");
                     setDoors(await res.json());
+                    setLastOkAt(Date.now());
+                    setFetchFailed(false);
                 } catch (err) {
+                    // Deliberately keep the last-known doors on screen rather
+                    // than blanking the dashboard — but record that we are no
+                    // longer in touch, so the UI can say so and refuse to act.
                     console.error(err);
+                    setFetchFailed(true);
                 }
             };
+
+            // Re-render once a second while stale so "as of N ago" counts up
+            // honestly instead of freezing at the moment contact was lost.
+            useEffect(() => {
+                if (!fetchFailed) return;
+                const t = setInterval(() => setNowTs(Date.now()), 1000);
+                return () => clearInterval(t);
+            }, [fetchFailed]);
+
+            const isStale = fetchFailed && lastOkAt !== null;
+            const staleSeconds = isStale ? Math.floor((nowTs - lastOkAt) / 1000) : 0;
+            const neverReached = fetchFailed && lastOkAt === null;
 
             // Initial load (only after auth is ready)
             useEffect(() => {
@@ -644,8 +681,28 @@
                         <SetupForm onClose={() => { checkConfig(); setView('dashboard'); }} onConfigChange={checkConfig} initialConfig={config} isAdmin={(user && user.isAdmin)} />
                     ) : (
                         <div className="space-y-3">
+                            {(isStale || neverReached) && (
+                                <div className="rounded-xl border-2 border-amber-400 bg-amber-50 p-3 flex items-start gap-3">
+                                    <span className="text-amber-600 text-xl leading-none mt-0.5">&#9888;</span>
+                                    <div>
+                                        <p className="font-bold text-amber-900 text-sm">Can&rsquo;t reach controller</p>
+                                        <p className="text-xs text-amber-800">
+                                            {neverReached
+                                                ? "No reading yet \u2014 door state below is not available."
+                                                : `Showing the last known state, from ${formatAge(staleSeconds)}. Controls are disabled until contact returns.`}
+                                        </p>
+                                    </div>
+                                </div>
+                            )}
                             {doors.map(door => (
-                                <DoorRow key={door.id} door={door} onCommand={sendCommand} isPast6pm={config.is_past_6pm} />
+                                <DoorRow
+                                    key={door.id}
+                                    door={door}
+                                    onCommand={sendCommand}
+                                    isPast6pm={config.is_past_6pm}
+                                    stale={isStale || neverReached}
+                                    staleSeconds={staleSeconds}
+                                />
                             ))}
                         </div>
                     )}
@@ -653,7 +710,7 @@
             );
         }
 
-        function DoorRow({ door, onCommand, isPast6pm }) {
+        function DoorRow({ door, onCommand, isPast6pm, stale = false, staleSeconds = 0 }) {
             const [isProcessing, setIsProcessing] = useState(false);
             const [optimisticState, setOptimisticState] = useState({
                 isHeld: door.is_held,
@@ -683,6 +740,10 @@
 
             const handle = async (action) => {
                 if (isProcessing) return;
+                // Acting on a stale reading is how you unlock a gate you think
+                // is locked. The controls are visually disabled too; this is the
+                // guard that actually holds.
+                if (stale) return;
                 // Don't allow hold_today if past 6 PM
                 if (action === 'hold_today' && isPast6pm) return;
                 setIsProcessing(true);
@@ -792,7 +853,7 @@
 
             return (
             <React.Fragment>
-                <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-4 flex flex-col gap-4 transition-all duration-300">
+                <div className={`rounded-xl shadow-sm p-4 flex flex-col gap-4 transition-all duration-300 ${stale ? 'bg-gray-50 border-2 border-dashed border-amber-300' : 'bg-white border border-gray-200'}`}>
                     {/* Top Row: Info */}
                     <div className="flex justify-between items-center">
                         <div className="flex items-center gap-4">
@@ -830,13 +891,18 @@
                                                 : "Open"))
                                         : (!door.is_online ? "Offline" : "Locked")}
                                 </p>
+                                {stale && (
+                                    <p className="text-xs text-amber-700 font-medium mt-0.5">
+                                        last known &middot; {formatAge(staleSeconds)}
+                                    </p>
+                                )}
                             </div>
                         </div>
                         {isProcessing && <Spinner size="sm" />}
                     </div>
 
                     {/* Bottom Row: Actions */}
-                    <div className="flex flex-col gap-1">
+                    <div className={`flex flex-col gap-1 ${stale ? 'opacity-40 pointer-events-none select-none' : ''}`} aria-disabled={stale}>
                         <div className="bg-gray-100 p-2 rounded-lg flex flex-col items-center justify-center text-sm font-medium text-gray-600 relative h-auto">
                             <label className="text-xs font-bold text-gray-700 uppercase tracking-wide mb-1.5">Open</label>
                             <div className="flex w-full gap-1 items-stretch">
