@@ -767,13 +767,28 @@ def list_devices():
 
     doors_json = []
     for d in doors:
-        # Status reads like the legacy display_status (open/closed + lock state).
-        if d.open:
+        # Status reads like the legacy display_status (open/closed + lock state),
+        # with one addition: "unknown".
+        #
+        # This used to be `if d.open / elif d.locked / else "unlocked"`, over a
+        # parser that turned any missing field into False. A door the controller
+        # could not describe therefore rendered as "unlocked" — stated with the
+        # same confidence as a real reading, next to a hardcoded is_online:True.
+        # For a physical gate that is the wrong direction to guess in.
+        #
+        # Order matters: report what we positively know, and claim nothing when
+        # the lock relay itself is unreadable. A known relay with an unknown
+        # position is still worth reporting — that is the security-relevant bit.
+        if d.locked is None and d.open is None:
+            status = "unknown"
+        elif d.open is True:
             status = "open"
-        elif d.locked:
+        elif d.locked is True:
             status = "locked"
-        else:
+        elif d.locked is False:
             status = "unlocked"
+        else:
+            status = "unknown"
 
         # imageUrl is set only when a real image is available — Protect camera,
         # Access /preview thumbnail, OR an admin-uploaded cover via the cookie
@@ -788,10 +803,15 @@ def list_devices():
             {
                 "id": d.id,
                 "name": d.name,
-                "is_online": True,
+                # Was hardcoded True, which asserted "this door is online and I
+                # know its state" even when we knew neither. Derive it.
+                "is_online": d.locked is not None or d.open is not None,
                 "status": status,
-                "lock_state": "lock" if d.locked else "unlock",
-                "door_position": "open" if d.open else "close",
+                # Kept as strings rather than nulls: the Android Device model
+                # types these as non-null, and a null would crash the client.
+                # "unknown" is a new value, not a new type.
+                "lock_state": {True: "lock", False: "unlock"}.get(d.locked, "unknown"),
+                "door_position": {True: "open", False: "close"}.get(d.open, "unknown"),
                 "imageUrl": f"/door-image/{d.id}" if has_real_image else None,
                 **hold,
             }
@@ -1087,8 +1107,8 @@ def get_debug_info(device_id):
         for d in access.list_doors():
             if d.id == device_id:
                 result["unifi"]["hardware_status"] = {
-                    "door_lock_relay_status": "lock" if d.locked else "unlock",
-                    "door_position_status": "open" if d.open else "close",
+                    "door_lock_relay_status": {True: "lock", False: "unlock"}.get(d.locked, "unknown"),
+                    "door_position_status": {True: "open", False: "close"}.get(d.open, "unknown"),
                     "is_bind_hub": d.bound_to_hub,
                 }
                 result["unifi"]["door"] = {
